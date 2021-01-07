@@ -201,7 +201,6 @@ class TestbedInfo(object):
         """
         m = re.match("(\d+)(?:\.(\d+))?(?:@(\d+))?", str(port).strip())
         m1, m2, m3 = m.groups()
-        dut_index = m1
         if m3:
             # Format: <dut_index>.<port_index>@<ptf_index>
             # Example: ['0.0@0,1.0@0', '0.1@1,1.1@1', '0.2@2,1.2@2', ... ]

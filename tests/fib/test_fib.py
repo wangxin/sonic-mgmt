@@ -13,7 +13,6 @@ import requests
 
 from tests.common.fixtures.ptfhost_utils import copy_ptftests_directory   # lgtm[py/unused-import]
 from tests.ptf_runner import ptf_runner
-from tests.common import utilities
 from tests.common.helpers.assertions import pytest_assert
 from tests.common.dualtor.dualtor_utils import mux_server_url
 
