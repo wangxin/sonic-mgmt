@@ -52,7 +52,7 @@ IPV6_BASE_PORT = 6000
 def get_topo_type(topo_name):
     pattern = re.compile(r'^(t0|t1|ptf|fullmesh|dualtor)')
     match = pattern.match(topo_name)
-    if match == None:
+    if not match:
         raise Exception("Unsupported testbed type - {}".format(topo_name))
     topo_type = match.group()
     if 'dualtor' in topo_type:
