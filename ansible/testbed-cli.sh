@@ -227,7 +227,6 @@ function add_topo
 
   # Delete the obsoleted arp entry for the PTF IP
   ip neighbor flush $ptf_ip
-
   echo Done
 }
 

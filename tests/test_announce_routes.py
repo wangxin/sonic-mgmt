@@ -1,7 +1,6 @@
 import pytest
 
 pytestmark = [
-    pytest.mark.pretest,
     pytest.mark.topology('util') #special marker
 ]
 
