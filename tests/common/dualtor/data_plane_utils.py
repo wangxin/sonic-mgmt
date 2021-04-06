@@ -1,6 +1,6 @@
-from collections import defaultdict
 import pytest
 import json
+import time
 from tests.common.dualtor.dual_tor_io import DualTorIO
 from tests.common.helpers.assertions import pytest_assert
 import threading
@@ -48,7 +48,7 @@ def validate_traffic_results(tor_IO, allowed_disruption, delay):
         total_received_packets = result['received_packets']
         received_packet_diff = result['received_packets'] - result['sent_packets']
         total_disruptions = len(result['disruptions'])
-        
+
         longest_disruption = 0
         for disruption in result['disruptions']:
             disruption_length = disruption['end_time'] - disruption['start_time']
@@ -81,9 +81,9 @@ def validate_traffic_results(tor_IO, allowed_disruption, delay):
 
         # Assert test results separately so all server results are logged
         if total_received_packets <= 0:
-            failures.append("Test failed to capture any meaningful received " 
+            failures.append("Test failed to capture any meaningful received "
                             "packets for server {}".format(server_ip))
-        
+
         if total_disruptions > allowed_disruption:
             failures.append("Traffic to server {} was "
                             "disrupted {} times. Allowed number of disruptions: {}"\
@@ -95,7 +95,7 @@ def validate_traffic_results(tor_IO, allowed_disruption, delay):
                             .format(server_ip, longest_disruption, delay))
 
         if total_duplications > allowed_disruption:
-            failures.append("Traffic to server {} was duplicated {} times. " 
+            failures.append("Traffic to server {} was duplicated {} times. "
                             "Allowed number of duplications: {}"
                             .format(server_ip, total_duplications, allowed_disruption))
 
@@ -106,12 +106,12 @@ def validate_traffic_results(tor_IO, allowed_disruption, delay):
 
         if bool(disruption_before_traffic):
             failures.append("Traffic on server {} was disrupted prior to test start, "
-                            "missing {} packets from the start of the packet flow"
+                            "packets before {} are missing from the start of the packet flow"
                             .format(server_ip, disruption_before_traffic))
 
         if bool(disruption_after_traffic):
             failures.append("Traffic on server {} was disrupted after test end, "
-                            "missing {} packets from the end of the packet flow"
+                            "packets after {} are missing from the end of the packet flow"
                             .format(server_ip, disruption_after_traffic))
 
     pytest_assert(len(failures) == 0, '\n' + '\n'.join(failures))
@@ -144,9 +144,11 @@ def run_test(duthosts, activehost, ptfhost, ptfadapter, action,
         # do not perform the provided action until
         # IO threads (sender and sniffer) are ready
         io_ready.wait()
+        time.sleep(5)
         logger.info("Sender and sniffer threads started, ready to execute the "\
             "callback action")
         action()
+
     # Wait for the IO to complete before doing checks
     send_and_sniff.join()
     tor_IO.examine_flow()
@@ -181,7 +183,7 @@ def send_t1_to_server_with_action(duthosts, ptfhost, ptfadapter, tbinfo):
         function: A helper function to run and monitor the IO test
     """
     arp_setup(ptfhost)
-    
+
     duthosts_list = []
     def t1_to_server_io_test(activehost, tor_vlan_port=None,
                             delay=0, action=None, verify=False, send_interval=None):

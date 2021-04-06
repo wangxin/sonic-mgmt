@@ -7,19 +7,18 @@ import struct
 import ipaddress
 import logging
 import json
+import os
 import scapy.all as scapyall
 import ptf.testutils as testutils
 from itertools import cycle
 from operator import itemgetter
 from itertools import groupby
 
-from tests.ptf_runner import ptf_runner
 from natsort import natsorted
 from collections import defaultdict
 
 TCP_DST_PORT = 5000
 SOCKET_RECV_BUFFER_SIZE = 10 * 1024 * 1024
-PTFRUNNER_QLEN = 1000
 VLAN_INDEX = 0
 VLAN_HOSTS = 100
 VLAN_BASE_MAC_PATTERN = "72060001{:04}"
@@ -80,7 +79,7 @@ class DualTorIO:
         logger.info("PORTCHANNEL interfaces: {}".format(str(self.tor_pc_intfs)))
 
         self.time_to_listen = 180.0
-        self.sniff_time_incr = 0
+        self.sniff_time_incr = 30
         # Inter-packet send-interval (minimum interval 3.5ms)
         if send_interval < 0.0035:
             logger.warn("Minimum packet send-interval is .0035s. \
@@ -98,6 +97,7 @@ class DualTorIO:
             self.packets_per_server = self.packets_to_send // len(self.vlan_interfaces)
 
         self.all_packets = []
+        self.ptf_sniffer = '/root/dual_tor_sniffer.py'
 
     def _generate_vlan_servers(self):
         """
@@ -211,6 +211,7 @@ class DualTorIO:
         # This way, when sending packets we continuously send for all servers
         # instead of sending all packets for server #1, then all packets for
         # server #2, etc.
+        logger.info("Generating packets to be sent...")
         for i in range(self.packets_per_server):
             for server_ip in server_ip_list:
                 if random_source:
@@ -233,7 +234,7 @@ class DualTorIO:
                 packet = scapyall.Ether(str(tcp_tx_packet))
                 packet.load = payload
                 self.packets_list.append((ptf_t1_src_intf, str(packet)))
-
+        logger.info("Generating packets done.")
         self.sent_pkt_dst_mac = self.dut_mac
         self.received_pkt_src_mac = [self.vlan_mac]
 
@@ -285,6 +286,7 @@ class DualTorIO:
         # This way, when sending packets we continuously send for all servers
         # instead of sending all packets for server #1, then all packets for
         # server #2, etc.
+        logger.info("Generating packets to be sent...")
         for i in range(self.packets_per_server):
             for vlan_intf in vlan_src_intfs:
                 ptf_src_intf = self.tor_to_ptf_intf_map[vlan_intf]
@@ -301,6 +303,7 @@ class DualTorIO:
                 packet = scapyall.Ether(str(tcp_tx_packet))
                 packet.load = payload
                 self.packets_list.append((ptf_src_intf, str(packet)))
+        logger.info("Generating packets done.")
         self.sent_pkt_dst_mac = self.vlan_mac
         self.received_pkt_src_mac = [self.active_mac, self.standby_mac]
 
@@ -355,9 +358,16 @@ class DualTorIO:
             time.sleep(self.send_interval)
             testutils.send_packet(self.ptfadapter, *entry)
 
+        time.sleep(5)
+
         logger.info("Sender finished running after {}".format(
             str(datetime.datetime.now() - sender_start)))
 
+        # Try to stop sniffer earlier by sending SIGINT signal to the sniffer process
+        # Python installs a small number of signal handlers by default. SIGINT is translated into a
+        # KeyboardInterrupt exception.
+        sniffer_pid = self.ptfhost.command("pgrep -f {}".format(self.ptf_sniffer), module_ignore_errors=True)["stdout"]
+        self.ptfhost.command("kill -s SIGINT {}".format(sniffer_pid), module_ignore_errors=True)
 
     def traffic_sniffer_thread(self):
         """
@@ -384,7 +394,7 @@ class DualTorIO:
         scapy_sniffer = threading.Thread(target=self.scapy_sniff, kwargs={'sniff_timeout': wait,
             'sniff_filter': sniff_filter})
         scapy_sniffer.start()
-        time.sleep(2)               # Let the scapy sniff initialize completely.
+        time.sleep(10)              # Let the scapy sniff initialize completely.
         self.sniffer_started.set()  # Unblock waiter for the send_in_background.
         scapy_sniffer.join()
         logger.info("Sniffer finshed running after {}".format(str(datetime.datetime.now() - sniffer_start)))
@@ -405,34 +415,19 @@ class DualTorIO:
             sniff_filter (str): Filter that Scapy will use to collect only relevant packets
         """
         capture_pcap = '/tmp/capture.pcap'
-        sniffer_log = '/tmp/dualtor-sniffer.log'
-        result = ptf_runner(
-            self.ptfhost,
-            "ptftests",
-            "dualtor_sniffer.Sniff",
-            qlen=PTFRUNNER_QLEN,
-            platform_dir="ptftests",
-            platform="remote",
-            params={
-                "sniff_timeout" : sniff_timeout,
-                "sniff_filter" : sniff_filter,
-                "capture_pcap": capture_pcap,
-                "port_filter_expression": 'not (arp and ether src {})\
-                    and not tcp'.format(self.dut_mac)
-            },
-            log_file=sniffer_log,
-            module_ignore_errors=False
+        capture_log = '/tmp/capture.log'
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        sniffer_src = os.path.join(current_dir, 'dual_tor_sniffer.py')
+        self.ptfhost.copy(src=sniffer_src, dest=self.ptf_sniffer)
+        self.ptfhost.command(
+            'python {} -f "{}" -p {} -l {} -t {}'.format(
+                self.ptf_sniffer, sniff_filter, capture_pcap, capture_log, sniff_timeout
+            )
         )
-        logger.debug("Ptf_runner result: {}".format(result))
+        time.sleep(5)   # Wait for sniffer to exit and dump pcap file
 
-        logger.info('Fetching log files from ptf and dut hosts')
-        logs_list =  [
-            {'src': sniffer_log, 'dest': '/tmp/', 'flat': True, 'fail_on_missing': False},
-            {'src': capture_pcap, 'dest': '/tmp/', 'flat': True, 'fail_on_missing': False}
-        ]
-
-        for log_item in logs_list:
-            self.ptfhost.fetch(**log_item)
+        logger.info('Fetching pcap file from ptf')
+        self.ptfhost.fetch(src=capture_pcap, dest='/tmp/', flat=True, fail_on_missing=False)
 
         self.all_packets = scapyall.rdpcap(capture_pcap)
         logger.info("Number of all packets captured: {}".format(len(self.all_packets)))
