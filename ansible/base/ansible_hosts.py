@@ -47,6 +47,10 @@ class NoTasksError(AnsibleError):
     pass
 
 
+class AnsibleModuleFailed(AnsibleError):
+    pass
+
+
 class AnsibleHostsBase(object):
 
     def __init__(
@@ -156,16 +160,65 @@ class AnsibleHostsBase(object):
         if args:
             kwargs["_raw_params"] = " ".join(args)
 
+        # Support the "module_ignore_errors" kwarg added in the legacy class for backward compatibility
+        _module_ignore_errors = False
+        if 'module_ignore_errors' in kwargs:
+            _module_ignore_errors = kwargs.pop('module_ignore_errors')
+
         task_data = {
             "action": {
                 "module": module_name,
                 "args": kwargs
             },
         }
+        if _module_ignore_errors == True:
+            # It could be overwritten by the 'ignore_errors' in module_attrs if both are provided.
+            # This is to encourage the using of formal 'ignore_errors' attribute.
+            task_data['ignore_errors'] = True
+
         if module_attrs:
             task_data.update(module_attrs)
 
         return task_data
+
+    def _check_failed_results(self, results):
+        failed_results = []
+        if isinstance(self, AnsibleHost) or isinstance(self, AnsibleLocalhost):
+            # Single host
+            if isinstance(results, dict):
+                # Single task
+                if results.get('failed', False):
+                    if not results.get('_task_fields', {}).get('ignore_errors', False):
+                        failed_results.append(results)
+            elif isinstance(results, list):
+                # Multiple tasks
+                for res in results:
+                    if res.get('failed', False):
+                        if not res.get('_task_fields', {}).get('ignore_errors', False):
+                            failed_results.append(res)
+        elif isinstance(self, AnsibleHosts):
+            # Multiple hosts
+            if isinstance(results, dict):
+                # Multiple hosts, multiple tasks
+                for hostname in results:
+                    host_results = results[hostname]
+                    if isinstance(host_results, dict):
+                        # Single task
+                        if host_results.get('failed', False):
+                            if not host_results.get('_task_fields', {}).get('ignore_errors', False):
+                                failed_results.append(host_results)
+                    elif isinstance(host_results, list):
+                        # Multiple tasks
+                        for res in host_results:
+                            if res.get('failed', False):
+                                if not res.get('_task_fields', {}).get('ignore_errors', False):
+                                    failed_results.append(res)
+
+        if failed_results:
+            raise AnsibleModuleFailed(
+                f"Ansible module failed. If failure is expected, use `module_attrs={{'ignore_errors': True}}` "
+                f"to avoid raising an exception. Details: {json.dumps(failed_results, indent=4)}"
+            )
 
     def _run(
         self,
@@ -306,6 +359,8 @@ class AnsibleHostsBase(object):
             if tqm:
                 tqm.cleanup()
             self.loader.cleanup_all_tmp_files()
+
+        self._check_failed_results(results)
 
         return results
 
