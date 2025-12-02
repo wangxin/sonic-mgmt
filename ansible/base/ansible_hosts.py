@@ -1,0 +1,760 @@
+from __future__ import annotations
+
+import inspect
+import copy
+import os
+import logging
+import json
+from typing import Any, Optional
+
+import ansible
+
+from ansible import constants as C
+from ansible import context
+from ansible.errors import AnsibleError
+from ansible.plugins.loader import module_loader
+from ansible.parsing.dataloader import DataLoader
+from ansible.inventory.manager import InventoryManager
+from ansible.vars.manager import VariableManager
+from ansible.vars.hostvars import HostVars
+from ansible.executor.task_queue_manager import TaskQueueManager
+from ansible.playbook.play import Play
+from ansible.utils.display import Display
+from ansible.plugins.loader import init_plugin_loader
+from ansible.module_utils.common.collections import ImmutableDict
+
+
+display = Display()
+init_plugin_loader()
+
+# Logger for Ansible Python API
+logger = logging.getLogger("ansible_pyapi")
+
+
+class UnsupportedAnsibleModule(AnsibleError):
+    pass
+
+
+class NoAnsibleHostError(AnsibleError):
+    pass
+
+
+class MultipleAnsibleHostsError(AnsibleError):
+    pass
+
+
+class NoTasksError(AnsibleError):
+    pass
+
+
+class AnsibleHostsBase(object):
+
+    def __init__(
+        self,
+        inventory: str | list[str],
+        host_pattern: str,
+        hostvars: dict[str, Any] = {},
+        options: dict[str, Any] = {}
+    ) -> None:
+
+        self.inventory = inventory
+        self.host_pattern = host_pattern
+        self._extra_hostvars = hostvars
+
+        if host_pattern != 'localhost':
+            inventory_files = inventory if isinstance(inventory, list) else [inventory]
+            for inv_file in inventory_files:
+                if not os.path.exists(inv_file):
+                    raise AnsibleError(f"Inventory file does not exist: {inv_file}")
+
+        self.loader = DataLoader()
+        self.im = InventoryManager(loader=self.loader, sources=self.inventory)
+
+        # Ansible inventory hosts: list of <class 'ansible.inventory.host.Host'>
+        self.ans_inv_hosts = self.im.get_hosts(self.host_pattern)
+        self.hostnames = [host.name for host in self.ans_inv_hosts]
+        self.hosts_count = len(self.hostnames)
+        self.ips = [host.get_vars().get("ansible_host", None) for host in self.ans_inv_hosts]
+        self.v4ips = self.ips
+        self.v6ips = [host.get_vars().get("ansible_hostv6", None) for host in self.ans_inv_hosts]
+
+        self.vm = VariableManager(loader=self.loader, inventory=self.im)
+
+        # Use C.XXXX, so that defaults are consistent with ansible.cfg, can be overridden by env vars
+        self.options = {
+            "forks": C.DEFAULT_FORKS,
+            "connection": C.DEFAULT_TRANSPORT,
+            "verbosity": C.DEFAULT_VERBOSITY,
+            "timeout": C.DEFAULT_TIMEOUT,
+            "task_timeout": C.TASK_TIMEOUT,
+            "become_method": C.DEFAULT_BECOME_METHOD
+        }
+        if options:
+            self.options.update(options)
+
+        # Trigger ansible to load and render host variables in case host variables are defined as Jinja2 templates.
+        # After this operation, self.vm._hostvars will be populated with content
+        # self.vm._hostvars["example_hostname"] will return all variables visible by "example_hostname"
+        # The best part is that if the variable is a template, it is automatically rendered with correct data type
+        HostVars(inventory=self.im, variable_manager=self.vm, loader=self.loader)
+
+        if hostvars:
+            self.vm.extra_vars.update(hostvars)
+
+        self._loaded_modules: list[dict] = []
+        self._batch_mode: bool = False
+        self._batch_results: dict = {}
+
+    @staticmethod
+    def _get_caller_info(stack_depth: int = 2) -> tuple[str, int]:
+        """Get filename and line number of the caller.
+
+        Args:
+            stack_depth: How many levels up the stack to look (default 2)
+                        Higher values go further up the call stack
+
+        Returns:
+            tuple: (filename, line_number) of the caller
+        """
+        frame = inspect.currentframe()
+        try:
+            # Go up the stack to find the actual caller
+            for _ in range(stack_depth):
+                frame = frame.f_back
+                if frame is None:
+                    return "unknown", 0
+
+            frameinfo = inspect.getframeinfo(frame)
+            return frameinfo.filename, frameinfo.lineno
+        finally:
+            del frame  # Avoid reference cycles
+
+    @staticmethod
+    def _validate_module_name(module_name: str) -> None:
+        # Check if 'module_name' is a valid Ansible module
+        _module = module_loader.find_plugin_with_context(module_name)
+
+        if not _module.resolved:
+            searched_paths = module_loader.print_paths()
+            raise UnsupportedAnsibleModule(
+                f"\n"
+                f"    Ansible module '{module_name}' is not supported or could not be found.\n"
+                f'    Searched paths: {searched_paths}\n'
+                f'    Please ensure that ANSIBLE_LIBRARY is properly configured.\n'
+                f'    Ref: https://docs.ansible.com/ansible/latest/reference_appendices/config.html#envvar-ANSIBLE_LIBRARY'
+            )
+
+    @staticmethod
+    def build_task(
+        module_name: str,
+        args: list = [],
+        kwargs: dict = {},
+        module_attrs: dict = {}
+    ) -> dict:
+
+        kwargs = copy.deepcopy(kwargs)  # Copy to avoid argument passed by reference issue
+        if args:
+            kwargs["_raw_params"] = " ".join(args)
+
+        task_data = {
+            "action": {
+                "module": module_name,
+                "args": kwargs
+            },
+        }
+        if module_attrs:
+            task_data.update(module_attrs)
+
+        return task_data
+
+    def _run(
+        self,
+        tasks: list[dict] = [],
+        options: dict[str, Any] = {},
+        gather_facts: bool = False
+    ) -> dict | list[dict]:
+        # Validate tasks list
+        if not tasks or len(tasks) == 0:
+            raise NoTasksError("No tasks provided to execute")
+
+        tqm = None
+        try:
+            _options = copy.deepcopy(self.options)
+            _options.update(options)
+
+            # log_verbosity is not an Ansible context option. It is defined for our own logging purposes.
+            # Remove it from options before passing to Ansible.
+            log_verbosity = _options.pop('log_verbosity', None)
+            if log_verbosity is None:
+                log_verbosity = int(os.environ.get('ANSIBLE_PYAPI_VERBOSITY', 2))
+
+            context._init_global_context(ImmutableDict(**_options))
+
+            # Get caller information for logging
+            caller_file, caller_line = self._get_caller_info(stack_depth=3)
+            caller_file_base = os.path.basename(caller_file)
+            if logger.isEnabledFor(logging.DEBUG) and log_verbosity > 0:
+                for task in tasks:
+                    # To honor the ansible's no_log attribute
+                    # Ref: https://docs.ansible.com/ansible/latest/reference_appendices/logging.html#protecting-sensitive-data-with-no-log
+                    no_log = task.get('no_log', False)
+
+                    module_name = task['action']['module']
+                    log_prefix = f'{caller_file_base}:{caller_line} >> {self.host_pattern} =>'
+                    if log_verbosity == 1:
+                        if no_log:
+                            log_details = '[no_log]'
+                        else:
+                            log_details = f'{module_name}'
+                    elif log_verbosity >= 2:
+                        if no_log:
+                            log_details = '[no_log]'
+                        else:
+                            args = task['action'].get('args', {}).get('_raw_params', '').split(' ')
+                            kwargs = {k: v for k, v in task['action'].get('args', {}).items() if k != '_raw_params'}
+                            module_attrs = {k: v for k, v in task.items() if k != 'action'}
+                            log_details = (
+                                f'{module_name}, args={json.dumps(args)}, '
+                                f'kwargs={json.dumps(kwargs)}, module_attrs={json.dumps(module_attrs)}'
+                            )
+                    logger.debug(f'{log_prefix} {log_details}')
+
+            # This is to control the verbosity of ansible log printed to stdout.
+            # We wish the ansible's own log verbosity to be consistent with our logging verbosity.
+            # Ref: https://docs.ansible.com/ansible/latest/reference_appendices/config.html#envvar-ANSIBLE_VERBOSITY
+            original_verbosity = display.verbosity
+            if 'verbosity' in _options:
+                display.verbosity = _options['verbosity']
+
+            play = Play().load(
+                {
+                    "hosts": self.host_pattern,
+                    "gather_facts": gather_facts,
+                    "become_method": _options.get('become_method', 'sudo'),
+                    "connection": _options.get('connection', 'smart'),
+                    "ignore_errors": _options.get('ignore_errors', False),
+                    "tasks": tasks
+                },
+                variable_manager=self.vm,
+                loader=self.loader
+            )
+            if ansible.__version__ >= '2.19.0':
+                tqm = TaskQueueManager(
+                    inventory=self.im,
+                    variable_manager=self.vm,
+                    loader=self.loader,
+                    passwords={},
+                    stdout_callback_name='json_results',
+                    run_tree=False,
+                    forks=self.options.get("forks")
+                )
+            else:
+                tqm = TaskQueueManager(
+                    inventory=self.im,
+                    variable_manager=self.vm,
+                    loader=self.loader,
+                    passwords={},
+                    stdout_callback='json_results',
+                    run_tree=False,
+                    forks=self.options.get("forks")
+                )
+            tqm.load_callbacks()
+
+            tqm.run(play)
+
+            stdout_callback = tqm._stdout_callback
+            results = stdout_callback.results
+
+            # results is a dict: {hostname: [task_result_dict, ...], ...}
+            # It makes sense to return this format of results for multiple hosts and multiple tasks
+            # However, for single host or single task scenarios, we can simplify the results structure
+            # Simplify results based on number of tasks
+            if len(tasks) == 1:  # This means single task, but could still be multiple hosts
+                # Single task, results is a list of dict with single item. Convert to single dict per host
+                for hostname in results:
+                    if isinstance(results[hostname], list) and len(results[hostname]) == 1:
+                        results[hostname] = results[hostname][0]
+
+            # For single host scenarios, return just the single host's result without hostname key
+            if isinstance(self, AnsibleHost) or isinstance(self, AnsibleLocalhost):
+                results = results[self.hostname]
+
+            _tqm_stats = {
+                'processed': tqm._stats.processed,
+                'failures': tqm._stats.failures,
+                'ok': tqm._stats.ok,
+                'unreachable': tqm._stats.dark,
+                'changed': tqm._stats.changed,
+                'skipped': tqm._stats.skipped,
+                'rescued': tqm._stats.rescued,
+                'ignored': tqm._stats.ignored,
+            }
+
+            if logger.isEnabledFor(logging.DEBUG) and log_verbosity > 0:
+                if log_verbosity == 1:
+                    logger.debug(f'{caller_file}:{caller_line} >> {self.host_pattern} => done')
+                elif log_verbosity == 2:
+                    logger.debug(f'{caller_file}:{caller_line} >> {self.host_pattern} => {json.dumps(results)}')
+                elif log_verbosity >= 3:
+                    logger.debug(f'{caller_file}:{caller_line} >> {self.host_pattern} => {json.dumps(results, indent=4)}')
+                    if log_verbosity >= 4:
+                        logger.debug(f'{caller_file}:{caller_line} >> TaskQueueManager Stats: {json.dumps(_tqm_stats, indent=4)}')
+
+
+        finally:
+            display.verbosity = original_verbosity
+            if tqm:
+                tqm.cleanup()
+            self.loader.cleanup_all_tmp_files()
+
+        return results
+
+    def run_module(
+        self,
+        module_name: str,
+        args: list = [],
+        kwargs: dict = {},
+        module_attrs: dict = {},
+        options: dict = {},
+        gather_facts: bool = False
+    ) -> dict | list[dict]:
+
+        task = self.build_task(
+            module_name=module_name,
+            args=args,
+            kwargs=kwargs,
+            module_attrs=module_attrs
+        )
+
+        results = self._run(tasks=[task], options=options, gather_facts=gather_facts)
+        return results
+
+    def load_module(
+        self,
+        module_name: str,
+        args: list = [],
+        kwargs: dict = {},
+        module_attrs: dict = {}
+    ) -> None:
+        task = self.build_task(
+            module_name=module_name,
+            args=args,
+            kwargs=kwargs,
+            module_attrs=module_attrs
+        )
+        self._loaded_modules.append(task)
+
+    def run_loaded_modules(
+        self,
+        options: dict[str, Any] = {},
+        gather_facts: bool = False
+    ) -> dict | list[dict]:
+        try:
+            results = self._run(tasks=self._loaded_modules, options=options, gather_facts=gather_facts)
+        finally:
+            self._loaded_modules = []
+
+        return results
+
+    def __getattr__(self, name: str) -> callable:
+
+        def _run_ansible_module(
+            *args,
+            module_attrs: dict = {},
+            options: dict = {},
+            gather_facts: bool = False,
+            **kwargs
+        ) -> Optional[dict | list[dict]]:
+            task = self.build_task(
+                module_name=name,
+                args=args,
+                kwargs=kwargs,
+                module_attrs=module_attrs
+            )
+            if self._batch_mode:
+                self._loaded_modules.append(task)
+                # options and gather_facts argument are ignored in batch mode
+                # Module is not executed immediately, so no results to return.
+                # Loaded modules will be executed when context manager exits
+            else:
+                return self._run(tasks=[task], options=options, gather_facts=gather_facts)
+
+        return _run_ansible_module
+
+    def __enter__(self) -> AnsibleHostsBase:
+        self._batch_mode = True
+        self._loaded_modules = []
+        self._batch_results = {}
+        logger.debug("===== Entering AnsibleHostsBase context manager for batch module execution. =====")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            self._batch_results = self._run(tasks=self._loaded_modules)
+        finally:
+            self._batch_mode = False
+            self._loaded_modules = []
+            logger.debug(
+                "===== Exiting AnsibleHostsBase context manager after batch module execution. "
+                "Access results via 'results' property of the instance. ====="
+            )
+
+    @property
+    def results(self) -> dict:
+        '''Returns the results tasks executed in context.
+
+        Clears the stored results after returning them to avoid stale data on subsequent calls.
+        '''
+        _batch_results = self._batch_results
+        self._batch_results = {}
+        return _batch_results
+
+    def get_host_vars(self, hostname: str, var_name: Optional[str] = None, default: Any = None) -> Any:
+        """Get variables directly defined for a specific host.
+
+        Returns only variables from host_vars/, not group_vars or other sources.
+
+        Args:
+            hostname: Name of the host to get variables for
+            var_name: Optional specific variable name to retrieve. If None, returns all host vars.
+            default: Default value to return if var_name is not found (only used when var_name is specified)
+
+        Returns:
+            If var_name is None: Dictionary of variables directly defined for this host
+            If var_name is specified: Value of the specific variable, or default if not found
+
+        Raises:
+            KeyError: If hostname is not in the matched hosts
+        """
+        if hostname not in self.hostnames:
+            raise KeyError(f"Host '{hostname}' not found in matched hosts: {self.hostnames}")
+
+        # Get the inventory host object
+        inv_host = None
+        for host in self.ans_inv_hosts:
+            if host.name == hostname:
+                inv_host = host
+                break
+
+        # Get host-specific variables (not group vars)
+        host_vars_dict = inv_host.get_vars() if inv_host else {}
+
+        if var_name is None:
+            return host_vars_dict
+        else:
+            return host_vars_dict.get(var_name, default)
+
+    def get_visible_vars(self, hostname: str, var_name: Optional[str] = None, default: Any = None) -> Any:
+        """Get all variables visible to a specific host.
+
+        Includes host_vars, group_vars, inventory vars, extra_vars.
+        Jinja2 templates are automatically rendered.
+
+        Args:
+            hostname: Name of the host to get variables for
+            var_name: Optional specific variable name to retrieve. If None, returns all visible vars.
+            default: Default value to return if var_name is not found (only used when var_name is specified)
+
+        Returns:
+            If var_name is None: Dictionary of all variables visible to this host (computed/resolved)
+            If var_name is specified: Value of the specific variable, or default if not found
+
+        Raises:
+            KeyError: If hostname is not in the matched hosts
+        """
+        if hostname not in self.hostnames:
+            raise KeyError(f"Host '{hostname}' not found in matched hosts: {self.hostnames}")
+
+        # Use VariableManager's _hostvars which contains all variables
+        # including group vars, inventory vars, and extra vars
+        # Templates are automatically rendered
+        visible_vars_dict = dict(self.vm._hostvars[hostname])
+
+        if var_name is None:
+            return visible_vars_dict
+        else:
+            return visible_vars_dict.get(var_name, default)
+
+    @property
+    def extra_vars(self) -> dict[str, Any]:
+        """Get extra variables.
+
+        Returns:
+            Dictionary of extra variables
+        """
+        return self.vm.extra_vars
+
+
+class AnsibleHosts(AnsibleHostsBase):
+    """Subclass for working with multiple Ansible hosts.
+
+    Supports container-like operations:
+    - Indexing: hosts[0] or hosts['hostname']
+    - Iteration: for host in hosts:
+    - Length: len(hosts)
+    """
+
+    def __init__(
+        self,
+        inventory: str | list[str],
+        host_pattern: str,
+        hostvars: dict[str, Any] = {},
+        options: dict[str, Any] = {}
+    ) -> None:
+        super().__init__(inventory, host_pattern, hostvars, options)
+
+        # Validate that at least one host matches the pattern
+        if self.hosts_count == 0:
+            raise NoAnsibleHostError(
+                f"No host '{self.host_pattern}' in inventory '{self.inventory}'"
+            )
+
+    def __getitem__(self, key: int | str) -> AnsibleHost:
+        """Support both integer and string indexing.
+
+        Args:
+            key: Integer index (0-based) or hostname string
+
+        Returns:
+            AnsibleHost instance for the specified host
+
+        Examples:
+            hosts[0]          # First host by integer index
+            hosts['vlab-01']  # Host by hostname
+        """
+        if isinstance(key, int):
+            # Integer indexing
+            if key < 0 or key >= len(self.hostnames):
+                raise IndexError(f"Index {key} out of range for {len(self.hostnames)} hosts")
+            hostname = self.hostnames[key]
+        elif isinstance(key, str):
+            # String indexing by hostname
+            if key not in self.hostnames:
+                raise KeyError(f"Host '{key}' not found in matched hosts: {self.hostnames}")
+            hostname = key
+        else:
+            raise TypeError(f"Indices must be integers or strings, not {type(key).__name__}")
+
+        # Return an AnsibleHost instance for the specific host
+        return AnsibleHost(
+            inventory=self.inventory,
+            host_pattern=hostname,
+            hostvars=self._extra_hostvars,
+            options=self.options
+        )
+
+    def __iter__(self):
+        """Support iteration over hosts.
+
+        Yields:
+            AnsibleHost instances for each host
+
+        Example:
+            for host in hosts:
+                print(host.hostname)
+        """
+        for hostname in self.hostnames:
+            yield AnsibleHost(
+                inventory=self.inventory,
+                host_pattern=hostname,
+                hostvars=self._extra_hostvars,
+                options=self.options
+            )
+
+    def __len__(self) -> int:
+        """Return the number of hosts.
+
+        Returns:
+            Number of hosts matched by the host_pattern
+
+        Example:
+            len(hosts)  # Returns count of matched hosts
+        """
+        return self.hosts_count
+
+    def __str__(self) -> str:
+        """Return a user-friendly string representation."""
+        return f"AnsibleHosts(pattern='{self.host_pattern}', hosts={self.hostnames})"
+
+    def __repr__(self) -> str:
+        """Return a detailed string representation for debugging."""
+        inv_str = self.inventory if isinstance(self.inventory, str) else f"[{', '.join(self.inventory)}]"
+        return f"AnsibleHosts(inventory={inv_str}, host_pattern='{self.host_pattern}', hosts={self.hostnames})"
+
+
+class AnsibleHost(AnsibleHostsBase):
+    """Subclass for working with a single Ansible host."""
+
+    hostname: str
+    ip: Optional[str]
+    v4ip: Optional[str]
+    v6ip: Optional[str]
+
+    def __init__(
+        self,
+        inventory: str | list[str],
+        host_pattern: str,
+        hostvars: dict[str, Any] = {},
+        options: dict[str, Any] = {}
+    ) -> None:
+        super().__init__(inventory, host_pattern, hostvars, options)
+
+        # Validate that exactly one host matches the pattern
+        if self.hosts_count == 0:
+            raise NoAnsibleHostError(
+                f"No host '{self.host_pattern}' in inventory '{self.inventory}'"
+            )
+        elif self.hosts_count > 1:
+            raise MultipleAnsibleHostsError(
+                f"Expected exactly one host, but '{self.host_pattern}' matched {self.hosts_count} hosts in inventory '{self.inventory}': {self.hostnames}"
+            )
+
+        # Add singular attributes for single host access
+        self.hostname = self.hostnames[0]
+        self.ip = self.ips[0]
+        self.v4ip = self.v4ips[0]
+        self.v6ip = self.v6ips[0]
+
+    def get_host_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
+        """Get variables directly defined for this host.
+
+        Returns only variables from host_vars/, not group_vars or other sources.
+
+        Args:
+            var_name: Optional specific variable name to retrieve. If None, returns all host vars.
+            default: Default value to return if var_name is not found (only used when var_name is specified)
+
+        Returns:
+            If var_name is None: Dictionary of variables directly defined for this host
+            If var_name is specified: Value of the specific variable, or default if not found
+        """
+        return super().get_host_vars(self.hostname, var_name, default)
+
+    def get_visible_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
+        """Get all variables visible to this host.
+
+        Includes host_vars, group_vars, inventory vars, extra_vars.
+        Jinja2 templates are automatically rendered.
+
+        Args:
+            var_name: Optional specific variable name to retrieve. If None, returns all visible vars.
+            default: Default value to return if var_name is not found (only used when var_name is specified)
+
+        Returns:
+            If var_name is None: Dictionary of all variables visible to this host (computed/resolved)
+            If var_name is specified: Value of the specific variable, or default if not found
+        """
+        return super().get_visible_vars(self.hostname, var_name, default)
+
+    @property
+    def host_vars(self) -> dict[str, Any]:
+        """Variables directly defined for this host (convenience property).
+
+        Returns:
+            Dictionary of variables directly defined for this host
+        """
+        return self.get_host_vars()
+
+    @property
+    def visible_vars(self) -> dict[str, Any]:
+        """All variables visible to this host (convenience property).
+
+        Returns:
+            Dictionary of all variables visible to this host (computed/resolved)
+        """
+        return self.get_visible_vars()
+
+    def __str__(self) -> str:
+        """Return a user-friendly string representation."""
+        ip_info = f", ip={self.ip}" if self.ip else ""
+        return f"AnsibleHost(hostname='{self.hostname}'{ip_info})"
+
+    def __repr__(self) -> str:
+        """Return a detailed string representation for debugging."""
+        inv_str = self.inventory if isinstance(self.inventory, str) else f"[{', '.join(self.inventory)}]"
+        ip_info = f", ip={self.ip}" if self.ip else ""
+        v6_info = f", v6ip={self.v6ip}" if self.v6ip else ""
+        return f"AnsibleHost(inventory={inv_str}, hostname='{self.hostname}'{ip_info}{v6_info})"
+
+
+class AnsibleLocalhost(AnsibleHostsBase):
+    """Subclass for working with localhost."""
+
+    def __init__(
+        self,
+        inventory: Optional[str | list[str]] = None,
+        hostvars: dict[str, Any] = {},
+        options: dict[str, Any] = {}
+    ) -> None:
+        # Set default options for localhost
+        localhost_options = {
+            "connection": "local"
+        }
+        localhost_options.update(options)
+
+        # If no inventory provided, use implicit localhost
+        if inventory is None:
+            inventory = "/dev/null"  # Ansible accepts this for implicit localhost
+
+        super().__init__(inventory, "localhost", hostvars, localhost_options)
+
+        # Add singular attributes like AnsibleHost
+        self.hostname = "localhost"
+
+    def get_host_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
+        """Get variables directly defined for localhost.
+
+        Returns only variables from host_vars/, not group_vars or other sources.
+
+        Args:
+            var_name: Optional specific variable name to retrieve. If None, returns all host vars.
+            default: Default value to return if var_name is not found (only used when var_name is specified)
+
+        Returns:
+            If var_name is None: Dictionary of variables directly defined for localhost
+            If var_name is specified: Value of the specific variable, or default if not found
+        """
+        return super().get_host_vars(self.hostname, var_name, default)
+
+    def get_visible_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
+        """Get all variables visible to localhost.
+
+        Includes host_vars, group_vars, inventory vars, extra_vars.
+        Jinja2 templates are automatically rendered.
+
+        Args:
+            var_name: Optional specific variable name to retrieve. If None, returns all visible vars.
+            default: Default value to return if var_name is not found (only used when var_name is specified)
+
+        Returns:
+            If var_name is None: Dictionary of all variables visible to localhost (computed/resolved)
+            If var_name is specified: Value of the specific variable, or default if not found
+        """
+        return super().get_visible_vars(self.hostname, var_name, default)
+
+    @property
+    def host_vars(self) -> dict[str, Any]:
+        """Variables directly defined for localhost (convenience property).
+
+        Returns:
+            Dictionary of variables directly defined for localhost
+        """
+        return self.get_host_vars()
+
+    @property
+    def visible_vars(self) -> dict[str, Any]:
+        """All variables visible to localhost (convenience property).
+
+        Returns:
+            Dictionary of all variables visible to localhost (computed/resolved)
+        """
+        return self.get_visible_vars()
+
+    def __str__(self) -> str:
+        """Return a user-friendly string representation."""
+        return "AnsibleLocalhost(hostname='localhost')"
+
+    def __repr__(self) -> str:
+        """Return a detailed string representation for debugging."""
+        inv_str = self.inventory if isinstance(self.inventory, str) else f"[{', '.join(self.inventory)}]"
+        return f"AnsibleLocalhost(inventory={inv_str}, connection='local')"
