@@ -56,16 +56,16 @@ class AnsibleHostsBase(object):
     def __init__(
         self,
         inventory: str | list[str],
-        host_pattern: str,
+        pattern: str,
         hostvars: dict[str, Any] = {},
         options: dict[str, Any] = {}
     ) -> None:
 
         self.inventory = inventory
-        self.host_pattern = host_pattern
+        self.pattern = pattern
         self._extra_hostvars = hostvars
 
-        if host_pattern != 'localhost':
+        if pattern != 'localhost':
             inventory_files = inventory if isinstance(inventory, list) else [inventory]
             for inv_file in inventory_files:
                 if not os.path.exists(inv_file):
@@ -75,7 +75,7 @@ class AnsibleHostsBase(object):
         self.im = InventoryManager(loader=self.loader, sources=self.inventory)
 
         # Ansible inventory hosts: list of <class 'ansible.inventory.host.Host'>
-        self.ans_inv_hosts = self.im.get_hosts(self.host_pattern)
+        self.ans_inv_hosts = self.im.get_hosts(self.pattern)
         self.hostnames = [host.name for host in self.ans_inv_hosts]
         self.hosts_count = len(self.hostnames)
         self.ips = [host.get_vars().get("ansible_host", None) for host in self.ans_inv_hosts]
@@ -88,9 +88,9 @@ class AnsibleHostsBase(object):
         self.options = {
             "forks": C.DEFAULT_FORKS,
             "connection": C.DEFAULT_TRANSPORT,
-            "verbosity": C.DEFAULT_VERBOSITY,
             "timeout": C.DEFAULT_TIMEOUT,
             "task_timeout": C.TASK_TIMEOUT,
+            "become": C.DEFAULT_BECOME,
             "become_method": C.DEFAULT_BECOME_METHOD
         }
         if options:
@@ -235,9 +235,8 @@ class AnsibleHostsBase(object):
             _options = copy.deepcopy(self.options)
             _options.update(options)
 
-            # log_verbosity is not an Ansible context option. It is defined for our own logging purposes.
-            # Remove it from options before passing to Ansible.
-            log_verbosity = _options.pop('log_verbosity', None)
+            # According to the above logic, `verbosity` from `self._run` will overwrite the one from `self.__init__`.
+            log_verbosity = _options.pop('verbosity', None)
             if log_verbosity is None:
                 log_verbosity = int(os.environ.get('ANSIBLE_PYAPI_VERBOSITY', 2))
 
@@ -253,7 +252,7 @@ class AnsibleHostsBase(object):
                     no_log = task.get('no_log', False)
 
                     module_name = task['action']['module']
-                    log_prefix = f'{caller_file_base}:{caller_line} >> {self.host_pattern} =>'
+                    log_prefix = f'{caller_file_base}:{caller_line} >> {self.hostnames} =>'
                     if log_verbosity == 1:
                         if no_log:
                             log_details = '[no_log]'
@@ -272,16 +271,16 @@ class AnsibleHostsBase(object):
                             )
                     logger.debug(f'{log_prefix} {log_details}')
 
-            # This is to control the verbosity of ansible log printed to stdout.
-            # We wish the ansible's own log verbosity to be consistent with our logging verbosity.
-            # Ref: https://docs.ansible.com/ansible/latest/reference_appendices/config.html#envvar-ANSIBLE_VERBOSITY
-            original_verbosity = display.verbosity
-            if 'verbosity' in _options:
-                display.verbosity = _options['verbosity']
+            # The ansible logging level is not determined by the `verbosity` value in options.
+            # Set ansible logging level according to 'verbosity' configuration in ansible.cfg
+            # or by ANSIBLE_VERBOSITY env var.
+            # Ref: https://docs.ansible.com/projects/ansible/latest/reference_appendices/config.html#default-verbosity
+            _original_display_verbosity = display.verbosity
+            display.verbosity = C.DEFAULT_VERBOSITY
 
             play = Play().load(
                 {
-                    "hosts": self.host_pattern,
+                    "hosts": self.pattern,
                     "gather_facts": gather_facts,
                     "become_method": _options.get('become_method', 'sudo'),
                     "connection": _options.get('connection', 'smart'),
@@ -345,20 +344,19 @@ class AnsibleHostsBase(object):
 
             if logger.isEnabledFor(logging.DEBUG) and log_verbosity > 0:
                 if log_verbosity == 1:
-                    logger.debug(f'{caller_file}:{caller_line} >> {self.host_pattern} => done')
+                    logger.debug(f'{caller_file}:{caller_line} >> {self.hostnames} => done')
                 elif log_verbosity == 2:
-                    logger.debug(f'{caller_file}:{caller_line} >> {self.host_pattern} => {json.dumps(results)}')
+                    logger.debug(f'{caller_file}:{caller_line} >> {self.hostnames} => {json.dumps(results)}')
                 elif log_verbosity >= 3:
-                    logger.debug(f'{caller_file}:{caller_line} >> {self.host_pattern} => {json.dumps(results, indent=4)}')
+                    logger.debug(f'{caller_file}:{caller_line} >> {self.hostnames} => {json.dumps(results, indent=4)}')
                     if log_verbosity >= 4:
                         logger.debug(f'{caller_file}:{caller_line} >> TaskQueueManager Stats: {json.dumps(_tqm_stats, indent=4)}')
 
-
         finally:
-            display.verbosity = original_verbosity
             if tqm:
                 tqm.cleanup()
             self.loader.cleanup_all_tmp_files()
+            display.verbosity = _original_display_verbosity
 
         self._check_failed_results(results)
 
@@ -381,7 +379,24 @@ class AnsibleHostsBase(object):
             module_attrs=module_attrs
         )
 
-        results = self._run(tasks=[task], options=options, gather_facts=gather_facts)
+        if self._batch_mode:
+            self._loaded_modules.append(task)
+            # `options` and `gather_facts` argument are ignored in batch mode
+            # Module is not executed immediately, so no results to return.
+            # Loaded modules will be executed when context manager exits
+
+        try:
+            results = self._run(tasks=[task], options=options, gather_facts=gather_facts)
+        except Exception as e:
+            if isinstance(args, str):
+                raise type(e)(
+                    f"{str(e)}\n"
+                    f"Note: 'args' parameter must be a list, not a string. "
+                    f"You passed args='{args}' (string). Use args=['{args}'] instead."
+                ) from e
+            else:
+                raise
+
         return results
 
     def load_module(
@@ -405,6 +420,8 @@ class AnsibleHostsBase(object):
         gather_facts: bool = False
     ) -> dict | list[dict]:
         try:
+            if len(self._loaded_modules) == 0:
+                return {}
             results = self._run(tasks=self._loaded_modules, options=options, gather_facts=gather_facts)
         finally:
             self._loaded_modules = []
@@ -428,7 +445,7 @@ class AnsibleHostsBase(object):
             )
             if self._batch_mode:
                 self._loaded_modules.append(task)
-                # options and gather_facts argument are ignored in batch mode
+                # `options` and `gather_facts` argument are ignored in batch mode
                 # Module is not executed immediately, so no results to return.
                 # Loaded modules will be executed when context manager exits
             else:
@@ -552,16 +569,16 @@ class AnsibleHosts(AnsibleHostsBase):
     def __init__(
         self,
         inventory: str | list[str],
-        host_pattern: str,
+        pattern: str,
         hostvars: dict[str, Any] = {},
         options: dict[str, Any] = {}
     ) -> None:
-        super().__init__(inventory, host_pattern, hostvars, options)
+        super().__init__(inventory, pattern, hostvars, options)
 
-        # Validate that at least one host matches the pattern
+        # Validate that at least one host matches the 'pattern'
         if self.hosts_count == 0:
             raise NoAnsibleHostError(
-                f"No host '{self.host_pattern}' in inventory '{self.inventory}'"
+                f"No host '{self.pattern}' in inventory '{self.inventory}'"
             )
 
     def __getitem__(self, key: int | str) -> AnsibleHost:
@@ -593,7 +610,7 @@ class AnsibleHosts(AnsibleHostsBase):
         # Return an AnsibleHost instance for the specific host
         return AnsibleHost(
             inventory=self.inventory,
-            host_pattern=hostname,
+            pattern=hostname,
             hostvars=self._extra_hostvars,
             options=self.options
         )
@@ -611,7 +628,7 @@ class AnsibleHosts(AnsibleHostsBase):
         for hostname in self.hostnames:
             yield AnsibleHost(
                 inventory=self.inventory,
-                host_pattern=hostname,
+                pattern=hostname,
                 hostvars=self._extra_hostvars,
                 options=self.options
             )
@@ -620,7 +637,7 @@ class AnsibleHosts(AnsibleHostsBase):
         """Return the number of hosts.
 
         Returns:
-            Number of hosts matched by the host_pattern
+            Number of hosts matched by the 'pattern'
 
         Example:
             len(hosts)  # Returns count of matched hosts
@@ -629,12 +646,12 @@ class AnsibleHosts(AnsibleHostsBase):
 
     def __str__(self) -> str:
         """Return a user-friendly string representation."""
-        return f"AnsibleHosts(pattern='{self.host_pattern}', hosts={self.hostnames})"
+        return f"AnsibleHosts(pattern='{self.pattern}', hostnames={self.hostnames})"
 
     def __repr__(self) -> str:
         """Return a detailed string representation for debugging."""
         inv_str = self.inventory if isinstance(self.inventory, str) else f"[{', '.join(self.inventory)}]"
-        return f"AnsibleHosts(inventory={inv_str}, host_pattern='{self.host_pattern}', hosts={self.hostnames})"
+        return f"AnsibleHosts(inventory={inv_str}, pattern='{self.pattern}', hostnames={self.hostnames})"
 
 
 class AnsibleHost(AnsibleHostsBase):
@@ -648,20 +665,19 @@ class AnsibleHost(AnsibleHostsBase):
     def __init__(
         self,
         inventory: str | list[str],
-        host_pattern: str,
+        pattern: str,
         hostvars: dict[str, Any] = {},
         options: dict[str, Any] = {}
     ) -> None:
-        super().__init__(inventory, host_pattern, hostvars, options)
-
-        # Validate that exactly one host matches the pattern
+        super().__init__(inventory, pattern, hostvars, options)
+        # Validate that exactly one host matches the 'pattern'
         if self.hosts_count == 0:
             raise NoAnsibleHostError(
-                f"No host '{self.host_pattern}' in inventory '{self.inventory}'"
+                f"No host '{self.pattern}' in inventory '{self.inventory}'"
             )
         elif self.hosts_count > 1:
             raise MultipleAnsibleHostsError(
-                f"Expected exactly one host, but '{self.host_pattern}' matched {self.hosts_count} hosts in inventory '{self.inventory}': {self.hostnames}"
+                f"Expected exactly one host, but '{self.pattern}' matched {self.hosts_count} hosts in inventory '{self.inventory}': {self.hostnames}"
             )
 
         # Add singular attributes for single host access
@@ -748,7 +764,7 @@ class AnsibleLocalhost(AnsibleHostsBase):
         localhost_options.update(options)
 
         # If no inventory provided, use implicit localhost
-        if inventory is None:
+        if not inventory:
             inventory = "/dev/null"  # Ansible accepts this for implicit localhost
 
         super().__init__(inventory, "localhost", hostvars, localhost_options)
