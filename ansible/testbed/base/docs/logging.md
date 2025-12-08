@@ -355,3 +355,81 @@ DEBUG:ansible_pyapi:/data/code/sonic-mgmt-ng/ansible/demo_ansible_logging.py:6 >
 }
 $
 ```
+
+## "no_log"
+
+When `no_log` is set to `True` in the `module_attrs` argument of module execution methods, the module results will not include detailed output. This is used when running Ansible modules that may expose sensitive information in their results.
+
+Assume you run the following example script in the docker-sonic-mgmt container:
+```python
+import logging
+from testbed.base.ansible_hosts import AnsibleHost
+logging.basicConfig(level=logging.DEBUG)
+
+dut = AnsibleHost('veos_vtb', 'vlab-01', options={'verbosity': 3})
+dut.command('uptime', module_attrs={'no_log': True})
+```
+
+
+```
+$ export ANSIBLE_VERBOSITY=3
+$ python demo_ansible_logging.py
+DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => [no_log]
+Skipping callback 'json_results', as we already have a stdout callback.
+Skipping callback 'yaml', as we already have a stdout callback.
+Skipping callback 'default', as we already have a stdout callback.
+Skipping callback 'minimal', as we already have a stdout callback.
+Skipping callback 'oneline', as we already have a stdout callback.
+<vlab-01> Attempting python interpreter discovery
+<10.250.0.101> ESTABLISH SSH CONNECTION FOR USER: admin
+<10.250.0.101> SSH: EXEC sshpass -d12 ssh -vvv -o ControlMaster=auto -o ControlPersist=180s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=40 -o StrictHostKeyChecking=no -o 'User="admin"' -o ConnectTimeout=60 -o 'ControlPath="/home/xiwang5/.ansible/cp/e95704e219"' 10.250.0.101 '/bin/sh -c '"'"'echo PLATFORM; uname; echo FOUND; command -v '"'"'"'"'"'"'"'"'python3.13'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'python3.12'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'python3.11'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'python3.10'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'python3.9'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'python3.8'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'/usr/bin/python3'"'"'"'"'"'"'"'"'; command -v '"'"'"'"'"'"'"'"'python3'"'"'"'"'"'"'"'"'; echo ENDFOUND && sleep 0'"'"''
+<10.250.0.101> rc=0, stdout and stderr censored due to no log
+<10.250.0.101> ESTABLISH SSH CONNECTION FOR USER: admin
+<10.250.0.101> SSH: EXEC sshpass -d12 ssh -vvv -o ControlMaster=auto -o ControlPersist=180s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=40 -o StrictHostKeyChecking=no -o 'User="admin"' -o ConnectTimeout=60 -o 'ControlPath="/home/xiwang5/.ansible/cp/e95704e219"' 10.250.0.101 '/bin/sh -c '"'"'/usr/bin/python3.11 && sleep 0'"'"''
+<10.250.0.101> rc=0, stdout and stderr censored due to no log
+<vlab-01> Python interpreter discovery fallback (unsupported Linux distribution: debian)
+Using module file /opt/venv/lib/python3.12/site-packages/ansible/modules/command.py
+Pipelining is enabled.
+<10.250.0.101> ESTABLISH SSH CONNECTION FOR USER: admin
+<10.250.0.101> SSH: EXEC sshpass -d12 ssh -vvv -o ControlMaster=auto -o ControlPersist=180s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=40 -o StrictHostKeyChecking=no -o 'User="admin"' -o ConnectTimeout=60 -o 'ControlPath="/home/xiwang5/.ansible/cp/e95704e219"' 10.250.0.101 '/bin/sh -c '"'"'/usr/bin/python3.11 && sleep 0'"'"''
+<10.250.0.101> rc=0, stdout and stderr censored due to no log
+[vlab-01] => {
+    "hostname": "vlab-01",
+    "reachable": true,
+    "failed": false,
+    "censored": "the output has been hidden due to the fact that 'no_log: true' was specified for this result",
+    "changed": true,
+    "_task_fields": {
+        "action": "command",
+        "become": null,
+        "become_method": "sudo",
+        "become_user": null,
+        "connection": "ssh",
+        "ignore_errors": false,
+        "ignore_unreachable": null,
+        "register": null,
+        "retries": null,
+        "timeout": 0
+    }
+}
+DEBUG:ansible_pyapi:/data/code/sonic-mgmt-ng/ansible/demo_ansible_logging.py:6 >> ['vlab-01'] => {
+    "hostname": "vlab-01",
+    "reachable": true,
+    "failed": false,
+    "censored": "the output has been hidden due to the fact that 'no_log: true' was specified for this result",
+    "changed": true,
+    "_task_fields": {
+        "action": "command",
+        "become": null,
+        "become_method": "sudo",
+        "become_user": null,
+        "connection": "ssh",
+        "ignore_errors": false,
+        "ignore_unreachable": null,
+        "register": null,
+        "retries": null,
+        "timeout": 0
+    }
+}
+$
+```
