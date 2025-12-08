@@ -207,7 +207,7 @@ This is the default verbosity level. When verbosity is 2, running each Ansible m
 
 ```
 $ python demo_ansible_logging.py
-DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, module_attrs={}
+DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, task_directives={}
 DEBUG:ansible_pyapi:/data/code/sonic-mgmt-ng/ansible/demo_ansible_logging.py:6 >> ['vlab-01'] => {"hostname": "vlab-01", "reachable": true, "failed": false, "changed": true, "stdout": " 08:43:52 up 18 days,  6:14,  0 user,  load average: 0.20, 0.41, 0.55", "stderr": "", "rc": 0, "cmd": ["uptime"], "start": "2025-12-08 08:43:52.270293", "end": "2025-12-08 08:43:52.284446", "delta": "0:00:00.014153", "msg": "", "invocation": {"module_args": {"_raw_params": "uptime", "_uses_shell": false, "expand_argument_vars": true, "stdin_add_newline": true, "strip_empty_ends": true, "argv": null, "chdir": null, "executable": null, "creates": null, "removes": null, "stdin": null}, "module_name": "command"}, "stdout_lines": [" 08:43:52 up 18 days,  6:14,  0 user,  load average: 0.20, 0.41, 0.55"], "stderr_lines": [], "ansible_facts": {"discovered_interpreter_python": "/usr/bin/python3.11"}, "_ansible_no_log": false, "_task_fields": {"action": "command", "become": null, "become_method": "sudo", "become_user": null, "connection": "ssh", "ignore_errors": false, "ignore_unreachable": null, "register": null, "retries": null, "timeout": 0}}
 $
 ```
@@ -218,11 +218,11 @@ When verbosity is 3, running each Ansible module generates two log entries. One 
 
 ```
 $ python demo_ansible_logging.py
-DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, module_attrs={}
+DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, task_directives={}
 DEBUG:ansible_pyapi:/data/code/sonic-mgmt-ng/ansible/demo_ansible_logging.py:6 >> ['vlab-01'] => {"hostname": "vlab-01", "reachable": true, "failed": false, "changed": true, "stdout": " 08:43:52 up 18 days,  6:14,  0 user,  load average: 0.20, 0.41, 0.55", "stderr": "", "rc": 0, "cmd": ["uptime"], "start": "2025-12-08 08:43:52.270293", "end": "2025-12-08 08:43:52.284446", "delta": "0:00:00.014153", "msg": "", "invocation": {"module_args": {"_raw_params": "uptime", "_uses_shell": false, "expand_argument_vars": true, "stdin_add_newline": true, "strip_empty_ends": true, "argv": null, "chdir": null, "executable": null, "creates": null, "removes": null, "stdin": null}, "module_name": "command"}, "stdout_lines": [" 08:43:52 up 18 days,  6:14,  0 user,  load average: 0.20, 0.41, 0.55"], "stderr_lines": [], "ansible_facts": {"discovered_interpreter_python": "/usr/bin/python3.11"}, "_ansible_no_log": false, "_task_fields": {"action": "command", "become": null, "become_method": "sudo", "become_user": null, "connection": "ssh", "ignore_errors": false, "ignore_unreachable": null, "register": null, "retries": null, "timeout": 0}}
 xiwang5@sonic-mgmt-new:/data/code/sonic-mgmt-ng/ansible$
 xiwang5@sonic-mgmt-new:/data/code/sonic-mgmt-ng/ansible$ python demo_ansible_logging.py
-DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, module_attrs={}
+DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, task_directives={}
 DEBUG:ansible_pyapi:/data/code/sonic-mgmt-ng/ansible/demo_ansible_logging.py:6 >> ['vlab-01'] => {
     "hostname": "vlab-01",
     "reachable": true,
@@ -284,7 +284,7 @@ When verbosity is 4, in addition to the logs from verbosity level 3, an extra lo
 
 ```
 $ python demo_ansible_logging.py
-DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, module_attrs={}
+DEBUG:ansible_pyapi:demo_ansible_logging.py:6 >> ['vlab-01'] => command, args=["uptime"], kwargs={}, task_directives={}
 DEBUG:ansible_pyapi:/data/code/sonic-mgmt-ng/ansible/demo_ansible_logging.py:6 >> ['vlab-01'] => {
     "hostname": "vlab-01",
     "reachable": true,
@@ -358,7 +358,9 @@ $
 
 ## "no_log"
 
-When `no_log` is set to `True` in the `module_attrs` argument of module execution methods, the module results will not include detailed output. This is used when running Ansible modules that may expose sensitive information in their results.
+When `no_log` is set to `True` in the `task_directives` argument of module execution methods, the module results will not include detailed output. This is used when running Ansible modules that may expose sensitive information in their results.
+
+For details of `task_directive` argument, please refer to [`task_directives`](task_directives.md).
 
 Assume you run the following example script in the docker-sonic-mgmt container:
 ```python
@@ -367,7 +369,7 @@ from testbed.base.ansible_hosts import AnsibleHost
 logging.basicConfig(level=logging.DEBUG)
 
 dut = AnsibleHost('veos_vtb', 'vlab-01', options={'verbosity': 3})
-dut.command('uptime', module_attrs={'no_log': True})
+dut.command('uptime', task_directives={'no_log': True})
 ```
 
 

@@ -161,16 +161,18 @@ For more examples and guides for how to use this library, please refer to the `d
 * [Basic usage](docs/basic_usage.md)
 * [Extra hostvars and options](docs/hostvars_options.md)
 * [Logging](docs/logging.md)
-
-
+* [task_directives](docs/task_directives.md)
+* Advanced topics
+  * [Fork](docs/fork.md)
 
 Possible topics:
 
 connection
-module attributes
 performance
 debug
 
 Jinja template
 When conditions, use in task or use `if` in python
 Loops. Loop in ansible, loop in python.
+fork
+run async

@@ -153,7 +153,7 @@ class AnsibleHostsBase(object):
         module_name: str,
         args: list = [],
         kwargs: dict = {},
-        module_attrs: dict = {}
+        task_directives: dict = {}
     ) -> dict:
 
         kwargs = copy.deepcopy(kwargs)  # Copy to avoid argument passed by reference issue
@@ -172,12 +172,12 @@ class AnsibleHostsBase(object):
             },
         }
         if _module_ignore_errors == True:
-            # It could be overwritten by the 'ignore_errors' in module_attrs if both are provided.
+            # It could be overwritten by the 'ignore_errors' in task_directives if both are provided.
             # This is to encourage the using of formal 'ignore_errors' attribute.
             task_data['ignore_errors'] = True
 
-        if module_attrs:
-            task_data.update(module_attrs)
+        if task_directives:
+            task_data.update(task_directives)
 
         return task_data
 
@@ -216,7 +216,7 @@ class AnsibleHostsBase(object):
 
         if failed_results:
             raise AnsibleModuleFailed(
-                f"Ansible module failed. If failure is expected, use `module_attrs={{'ignore_errors': True}}` "
+                f"Ansible module failed. If failure is expected, use `task_directives={{'ignore_errors': True}}` "
                 f"to avoid raising an exception. Details: {json.dumps(failed_results, indent=4)}"
             )
 
@@ -264,10 +264,10 @@ class AnsibleHostsBase(object):
                         else:
                             args = task['action'].get('args', {}).get('_raw_params', '').split(' ')
                             kwargs = {k: v for k, v in task['action'].get('args', {}).items() if k != '_raw_params'}
-                            module_attrs = {k: v for k, v in task.items() if k != 'action'}
+                            task_directives = {k: v for k, v in task.items() if k != 'action'}
                             log_details = (
                                 f'{module_name}, args={json.dumps(args)}, '
-                                f'kwargs={json.dumps(kwargs)}, module_attrs={json.dumps(module_attrs)}'
+                                f'kwargs={json.dumps(kwargs)}, task_directives={json.dumps(task_directives)}'
                             )
                     logger.debug(f'{log_prefix} {log_details}')
 
@@ -367,7 +367,7 @@ class AnsibleHostsBase(object):
         module_name: str,
         args: list = [],
         kwargs: dict = {},
-        module_attrs: dict = {},
+        task_directives: dict = {},
         options: dict = {},
         gather_facts: bool = False
     ) -> dict | list[dict]:
@@ -376,7 +376,7 @@ class AnsibleHostsBase(object):
             module_name=module_name,
             args=args,
             kwargs=kwargs,
-            module_attrs=module_attrs
+            task_directives=task_directives
         )
 
         if self._batch_mode:
@@ -404,13 +404,13 @@ class AnsibleHostsBase(object):
         module_name: str,
         args: list = [],
         kwargs: dict = {},
-        module_attrs: dict = {}
+        task_directives: dict = {}
     ) -> None:
         task = self.build_task(
             module_name=module_name,
             args=args,
             kwargs=kwargs,
-            module_attrs=module_attrs
+            task_directives=task_directives
         )
         self._loaded_modules.append(task)
 
@@ -432,7 +432,7 @@ class AnsibleHostsBase(object):
 
         def _run_ansible_module(
             *args,
-            module_attrs: dict = {},
+            task_directives: dict = {},
             options: dict = {},
             gather_facts: bool = False,
             **kwargs
@@ -441,7 +441,7 @@ class AnsibleHostsBase(object):
                 module_name=name,
                 args=args,
                 kwargs=kwargs,
-                module_attrs=module_attrs
+                task_directives=task_directives
             )
             if self._batch_mode:
                 self._loaded_modules.append(task)
