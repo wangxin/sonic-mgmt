@@ -1,0 +1,6 @@
+---
+  server_1:
+    ansible_user: xiwang5
+  vlab-01:
+    ansible_user: admin
+    ansible_password: password

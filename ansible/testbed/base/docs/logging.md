@@ -147,16 +147,19 @@ When `ANSIBLE_VERBOSITY` is set to `4` or higher, Ansible outputs even more deta
 
 Library logging is controlled by setting the `verbosity` value in the `options` argument.
 Both the class constructor and module execution methods (implicit and explicit) support the `options` argument.
-The value in module execution methods has higher priority. However, when running modules in batch mode, the `options` argument in module execution methods is ignored. Only the argument in the class constructor takes effect.
+The value in module execution methods has highest priority. However, when running modules in batch mode, the `options` argument in module execution methods is ignored. Only the argument in the class constructor takes effect.
+
+If `verbosity` is not supplied in class constructor or method execution method, it is default to get value from environment variable `ANSIBLE_PYAPI_VERBOSITY`.
+If the environment variable `ANSIBLE_PYAPI_VERBOSITY` is not set, it will be default to `2` according to current implementation.
 
 If the environment variable `ANSIBLE_PYAPI_VERBOSITY` is set, it has the highest priority.
 
 Priority | Example | Description
 ---------|---------|------------
-0 (low) |  `dut = AnsibleHost('veos_vtb', 'vlab-01', options={'verbosity': 1})`  | Class constructor
-1 | `dut.command('uptime', options={'verbosity': 2})` | Implicit module execution method
-1 | `dut.run_module('command', args=['uptime'], options={'verbosity': 2})` | Explicit module execution method
-2 (high) | `export ANSIBLE_PYAPI_VERBOSITY=3` | Environment variable
+0 (low) | `export ANSIBLE_PYAPI_VERBOSITY=3` | Environment variable
+1 |  `dut = AnsibleHost('veos_vtb', 'vlab-01', options={'verbosity': 1})`  | Class constructor
+2 | `dut.command('uptime', options={'verbosity': 2})` | Implicit module execution method
+3 (high) | `dut.run_module('command', args=['uptime'], options={'verbosity': 2})` | Explicit module execution method
 
 In the following batch mode examples, the `options` argument in module execution methods has no effect:
 
@@ -180,6 +183,14 @@ dut.command('uptime')
 ```
 
 Running the script in the docker-sonic-mgmt container demonstrates the effect of different library logging levels.
+
+Verbosity | Description
+--|--
+0 | No logging output.
+1 | Logs module call and result. Shows only module name, no arguments. Result shows basic status only (simply `done`).
+2 | Logs module call and result with full argument and result details. Results are not indented.
+3 | Same as verbosity 2, but results are formatted with indentation for better readability.
+4 | Same as verbosity 3, with additional indented log entry for TaskQueueManager statistics.
 
 ### verbosity=0
 
