@@ -1,7 +1,9 @@
 import json
 import logging
 
-from .base import AnsibleHost, AnsibleHosts
+from .base import AnsibleHosts
+from .base import AnsibleLocalhost
+from .base import TestServer
 from .config import CONSTANTS as C
 from .testbed import Testbed, get_testbed
 from .inventory import generate_group_inventory_file
@@ -197,6 +199,21 @@ def deploy_testbed(
         logger.info(f"Using specified server '{server}' for deployment")
         selected_server = server
 
-    # Prepare the server AnsibleHost object
-    server = AnsibleHost(group_inventory_file, selected_server)
+    # Prepare objects and gather facts for deployment
+    server = TestServer(group_inventory_file, selected_server)
+    localhost = AnsibleLocalhost(group_inventory_file, 'localhost')
 
+    # Setup the server (check Ubuntu version, install packages, install Docker, etc.)
+    logger.info(f"Setting up server '{selected_server}' before deployment")
+    server.setup_server()
+
+    # Allocate testbed index on the server
+    testbed_index = server.allocate_testbed_index(testbed.name)
+
+    # Allocate resources for the testbed
+
+    # If KVM testbed, bring up the SONiC VM
+
+    # Deploy PTF container
+
+    # Deploy the
