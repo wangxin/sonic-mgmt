@@ -18,30 +18,69 @@ class TestServer(AnsibleHost):
     TESTBEDS_FILE = C.SERVER_TESTBEDS_FILE  # /var/run/sonic/testbeds.json
     SERVER_READY_FILE = "/var/run/sonic/server_ready"
 
-    # Required packages for testbed server
-    REQUIRED_PACKAGES = [
-        "apt-transport-https",
-        "bridge-utils",
-        "ca-certificates",
-        "curl",
-        "cloud-image-utils",
-        "ifupdown",
-        "iproute2",
-        "libvirt-clients",
-        "libvirt-daemon-system",
-        "net-tools",
-        "openvswitch-switch",
-        "python3-libvirt",
-        "python3-pip",
-        "qemu",
-        "qemu-kvm",
-        "qemu-system-x86",
-        "qemu-utils",
-        "software-properties-common",
-        "util-linux",
-        "virtinst",
-        "vlan",
-    ]
+    # Required packages for testbed server by Ubuntu version
+    REQUIRED_PACKAGES = {
+        "22.04": [
+            "apt-transport-https",
+            "bridge-utils",
+            "ca-certificates",
+            "curl",
+            "ifupdown",
+            "iproute2",
+            "libvirt-clients",
+            "libvirt-dev",
+            "libvirt-daemon-system",
+            "net-tools",
+            "openvswitch-switch",
+            "pkg-config",
+            "python3",
+            "python-is-python3",
+            "python3-dev",
+            "python3-pip",
+            "python3-venv",
+            "qemu-system-x86",
+            "software-properties-common",
+            "util-linux",
+            "virtinst",
+            "vlan",
+        ],
+        "24.04": [
+            "apt-transport-https",
+            "bridge-utils",
+            "ca-certificates",
+            "curl",
+            "ifupdown",
+            "iproute2",
+            "libvirt-clients",
+            "libvirt-dev",
+            "libvirt-daemon-system",
+            "net-tools",
+            "openvswitch-switch",
+            "pkg-config",
+            "python3",
+            "python-is-python3",
+            "python3-dev",
+            "python3-pip",
+            "python3-venv",
+            "qemu-system-x86",
+            "software-properties-common",
+            "util-linux",
+            "virtinst",
+            "vlan",
+        ],
+    }
+
+    # Required Python pip packages by Ubuntu version
+    REQUIRED_PIP_PACKAGES = {
+        "22.04": [
+            "libvirt-python",
+            "docker",
+        ],
+        "24.04": [
+            "libvirt-python",
+            "docker",
+        ],
+    }
 
     def __init__(self, inventory, pattern, hostvars={}, options={}):
         super(TestServer, self).__init__(inventory, pattern, hostvars=hostvars, options=options)
@@ -114,32 +153,27 @@ class TestServer(AnsibleHost):
         Read and parse testbeds.json to get testbeds deployed on server.
 
         Returns:
-            dict: Dictionary containing deployed testbeds information,
-                  or empty dict if file doesn't exist or cannot be parsed
+            list: List of deployed testbeds (each testbed is a dict),
+                  or empty list if file doesn't exist or cannot be parsed
         """
         logger.debug(f"Reading deployed testbeds from {self.hostname}")
 
-        result = self.command(
-            f"cat {self.TESTBEDS_FILE}",
-            task_directives={"become": True},
+        result = self.server_testbeds(
+            operation='get',
+            testbeds_json_file=self.TESTBEDS_FILE,
             module_ignore_errors=True
         )
 
         if result.get("failed", False):
             logger.debug(f"No testbeds file found on {self.hostname} or access denied")
-            return {}
+            return []
 
-        try:
-            testbeds = json.loads(result["stdout"])
-            testbed_count = len(testbeds.get("testbeds", {}))
-            logger.debug(f"Found {testbed_count} deployed testbed(s) on {self.hostname}")
-            return testbeds
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON in testbeds file on {self.hostname}: {e}")
-            return {}
-        except Exception as e:
-            logger.error(f"Unexpected error reading testbeds from {self.hostname}: {e}")
-            return {}
+        # Extract testbeds list from the module result
+        testbeds_list = result.get("testbeds", [])
+        testbed_count = len(testbeds_list)
+        logger.debug(f"Found {testbed_count} deployed testbed(s) on {self.hostname}")
+
+        return testbeds_list
 
     def _check_ubuntu_version(self):
         """
@@ -204,15 +238,21 @@ class TestServer(AnsibleHost):
         Install required packages using apt.
 
         This private method installs all packages listed in REQUIRED_PACKAGES
-        using apt with a lock timeout.
+        for the detected Ubuntu version using apt with a lock timeout.
 
         Raises:
-            Exception: If package installation fails
+            Exception: If package installation fails or version not supported
         """
-        logger.info(f"Installing {len(self.REQUIRED_PACKAGES)} required packages on {self.hostname}")
+        version_id = self.os_release.get("VERSION_ID", "")
+        packages = self.REQUIRED_PACKAGES.get(version_id)
+
+        if not packages:
+            raise Exception(f"Unsupported Ubuntu version: {version_id}. Supported versions: {list(self.REQUIRED_PACKAGES.keys())}")
+
+        logger.info(f"Installing {len(packages)} required packages for Ubuntu {version_id} on {self.hostname}")
 
         self.apt(
-            name=self.REQUIRED_PACKAGES,
+            name=packages,
             state="present",
             update_cache=True,
             lock_timeout=600,  # Wait up to 10 minutes for apt lock
@@ -220,6 +260,77 @@ class TestServer(AnsibleHost):
         )
 
         logger.info(f"Successfully installed required packages on {self.hostname}")
+
+    def _install_pip_packages(self):
+        """
+        Install Python pip packages.
+
+        For Ubuntu 24.04, installs packages in a virtual environment at /opt/venv.
+        For Ubuntu 22.04, installs packages to the default location.
+        Installs packages listed in REQUIRED_PIP_PACKAGES for the detected version.
+
+        Raises:
+            Exception: If pip package installation fails or version not supported
+        """
+        version_id = self.os_release.get("VERSION_ID", "")
+        packages = self.REQUIRED_PIP_PACKAGES.get(version_id)
+
+        if not packages:
+            raise Exception(f"Unsupported Ubuntu version: {version_id}. Supported versions: {list(self.REQUIRED_PIP_PACKAGES.keys())}")
+
+        logger.info(f"Installing {len(packages)} Python pip packages for Ubuntu {version_id} on {self.hostname}")
+
+        if version_id == "24.04":
+            logger.info(f"Ubuntu 24.04 detected, installing pip packages to /opt/venv")
+
+            # Create virtual environment at /opt/venv
+            self.shell(
+                "python3 -m venv /opt/venv",
+                task_directives={"become": True}
+            )
+
+            # Update PATH to use /opt/venv/bin globally for all users and sessions
+            logger.info(f"Updating PATH to use /opt/venv/bin for Ubuntu 24.04")
+
+            # Update /etc/environment for all sessions (SSH, cron, systemd services, login/non-login shells)
+            self.lineinfile(
+                path="/etc/environment",
+                regexp="^PATH=",
+                line='PATH="/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"',
+                task_directives={"become": True}
+            )
+
+            # Update sudoers secure_path to include /opt/venv/bin for sudo commands
+            self.lineinfile(
+                path="/etc/sudoers.d/venv",
+                regexp="^Defaults\\s+secure_path=",
+                line='Defaults secure_path="/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"',
+                create=True,
+                mode="0440",
+                validate="/usr/sbin/visudo -cf %s",
+                task_directives={"become": True}
+            )
+
+            # Install packages in the virtual environment (after PATH is configured)
+            packages_str = " ".join(packages)
+            self.shell(
+                f"/opt/venv/bin/pip install {packages_str}",
+                task_directives={"become": True}
+            )
+
+            logger.info(f"Successfully installed pip packages to /opt/venv on {self.hostname}")
+        else:
+            logger.info(f"Ubuntu {version_id} detected, installing pip packages to default location")
+
+            # Install packages using system pip
+            self.pip(
+                name=packages,
+                state="present",
+                executable="pip3",
+                task_directives={"become": True}
+            )
+
+            logger.info(f"Successfully installed pip packages on {self.hostname}")
 
     def _install_docker(self):
         """
@@ -265,17 +376,27 @@ class TestServer(AnsibleHost):
             task_directives={"become": True}
         )
 
+        # Add the current user to the docker group to allow docker commands without sudo
+        logger.debug(f"Adding user to docker group on {self.hostname}")
+        self.shell("usermod -aG docker $USER && newgrp docker")
+
         logger.info(f"Successfully installed Docker on {self.hostname}")
 
-    def setup_server(self):
+    def setup_server(self, force=False):
         """
         Setup the server by installing required packages and marking it as ready.
 
+        Args:
+            force (bool): If True, force setup even if server is already marked as ready.
+                         Defaults to False.
+
         This method:
-        1. Checks Ubuntu version (minimum 22.04)
-        2. Installs all required packages using apt (with lock timeout)
-        3. Installs Docker
-        4. Creates a marker file to indicate server is ready
+        1. Checks if server is already ready (returns early if yes, unless force=True)
+        2. Checks Ubuntu version (minimum 22.04)
+        3. Installs all required packages using apt (with lock timeout)
+        4. Installs pip packages
+        5. Installs Docker
+        6. Creates a marker file to indicate server is ready
 
         Raises:
             Exception: If Ubuntu version check fails, package installation fails,
@@ -283,11 +404,22 @@ class TestServer(AnsibleHost):
         """
         logger.info(f"Setting up server {self.hostname}")
 
+        # Check if server is already ready
+        if self.server_ready and not force:
+            logger.info(f"Server {self.hostname} is already ready, skipping setup")
+            return
+
+        if force:
+            logger.info(f"Force setup enabled, proceeding with setup even if server is ready")
+
         # Check Ubuntu version first
         self._check_ubuntu_version()
 
         # Install required packages
         self._install_packages()
+
+        # Install pip packages
+        self._install_pip_packages()
 
         # Install Docker
         self._install_docker()

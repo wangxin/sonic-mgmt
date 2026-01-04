@@ -6,7 +6,9 @@ from .base import AnsibleLocalhost
 from .base import TestServer
 from .config import CONSTANTS as C
 from .testbed import Testbed, get_testbed
-from .inventory import generate_group_inventory_file
+from .inventory import generate_group_inventory_file, generate_testbed_inventory_file
+from .topology import get_topology_definition
+from .allocate import allocate_testbed_resources
 
 
 logger = logging.getLogger(__name__)
@@ -24,27 +26,27 @@ def get_all_deployed_testbeds(servers) -> dict[str, dict]:
     """
     logger.debug(f"Querying deployed testbeds from {len(servers)} server(s)")
 
-    raw_all_deployed_testbeds = servers.shell(
-        f'cat {C.SERVER_TESTBEDS_FILE}',
-        module_ignore_errors=True,
-        task_directives={'become': True}
+    raw_all_deployed_testbeds = servers.server_testbeds(
+        operation='get',
+        testbeds_json_file=C.SERVER_TESTBEDS_FILE,
+        module_ignore_errors=True
     )
 
     deployed_testbeds = {}
     for server_name, result in raw_all_deployed_testbeds.items():
-        if result['rc'] != 0:
+        if result.get('failed', False):
             # Could not read the testbeds file on this server
-            logger.debug(f"Server '{server_name}' has no testbeds file or is not accessible")
+            if not result.get('reachable', True):
+                logger.warning(f"Server '{server_name}' is not reachable")
+            else:
+                logger.debug(f"Server '{server_name}' has no testbeds file or module error")
             continue
 
-        try:
-            deployed_testbeds[server_name] = json.loads(result['stdout'])
-            testbed_count = len(deployed_testbeds[server_name].get('testbeds', {}))
-            logger.debug(f"Server '{server_name}' has {testbed_count} deployed testbed(s)")
-        except json.JSONDecodeError:
-            # Invalid JSON content
-            logger.warning(f"Server '{server_name}' has invalid testbeds file format")
-            continue
+        # Extract testbeds list from the module result
+        testbeds_list = result.get('testbeds', [])
+        deployed_testbeds[server_name] = {'testbeds': testbeds_list}
+        testbed_count = len(testbeds_list)
+        logger.debug(f"Server '{server_name}' has {testbed_count} deployed testbed(s)")
 
     logger.info(f"Found {len(deployed_testbeds)} server(s) with deployed testbeds")
     return deployed_testbeds
@@ -138,6 +140,161 @@ def pick_server_for_deployment(
     return None
 
 
+def check_testbed_deployment_status(
+        testbed_name: str,
+        deployed_testbeds: dict[str, dict]
+    ) -> str | None:
+    """
+    Check if a testbed is already deployed or being deployed on any server.
+
+    Args:
+        testbed_name: Name of the testbed to check
+        deployed_testbeds: Dictionary mapping server names to their deployed testbeds
+
+    Returns:
+        Server name if testbed is currently being deployed (status='deploying'), None otherwise
+
+    Raises:
+        RuntimeError: If testbed is already fully deployed or in an error state
+    """
+    currently_deploying_on_server = None
+
+    for server_name, deployed_testbeds_info in deployed_testbeds.items():
+        for _deployed_testbed in deployed_testbeds_info.get('testbeds', []):
+            if _deployed_testbed.get('testbed_name') == testbed_name:
+                _deployed_testbed_status = _deployed_testbed.get('status', 'unknown')
+                if _deployed_testbed_status == 'deployed':
+                    raise RuntimeError(
+                        f"Testbed '{testbed_name}' is already deployed on server '{server_name}'."
+                    )
+                elif _deployed_testbed_status == 'deploying':
+                    currently_deploying_on_server = server_name
+                    logger.warning(
+                        f"Testbed '{testbed_name}' is currently being deployed on server '{server_name}'."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Testbed '{testbed_name}' is already present on server '{server_name}' "
+                        f"with status '{_deployed_testbed_status}'. Please undeploy it first."
+                    )
+
+    return currently_deploying_on_server
+
+
+def resolve_deployment_server(
+        testbed_name: str,
+        server_from_cli: str | None,
+        server_from_testbed: str | None,
+        currently_deploying_on_server: str | None
+    ) -> str | None:
+    """
+    Resolve which server to use for testbed deployment.
+
+    Args:
+        testbed_name: Name of the testbed being deployed
+        server_from_cli: Server specified from command line argument
+        server_from_testbed: Server specified in testbed definition
+        currently_deploying_on_server: Server where testbed is currently being deployed (if any)
+
+    Returns:
+        The resolved server name, or None if no server could be determined
+
+    Raises:
+        RuntimeError: If there's a conflict between specified server and ongoing deployment
+    """
+    # Start with command line argument, fall back to testbed definition
+    server = server_from_cli if server_from_cli is not None else server_from_testbed
+
+    if server is None:
+        # No server specified in command line or testbed definition
+        logger.info('No server specified in command line or testbed definition')
+        if currently_deploying_on_server is not None:
+            logger.info(
+                f'Testbed {testbed_name} is currently being deployed on server {currently_deploying_on_server}.'
+                f' Will try to continue deployment on the same server.'
+            )
+            return currently_deploying_on_server
+        return None
+    else:
+        # Server is specified, check for conflicts with ongoing deployment
+        if currently_deploying_on_server is not None and server != currently_deploying_on_server:
+            raise RuntimeError(
+                f"Testbed '{testbed_name}' is currently being deployed on server '{currently_deploying_on_server}'. "
+                f"Cannot deploy to a different server '{server}' at the same time."
+            )
+        elif currently_deploying_on_server is not None and server == currently_deploying_on_server:
+            logger.info(
+                f'Testbed {testbed_name} is currently being deployed on server {currently_deploying_on_server}.'
+                f' Will try to continue deployment on the same server.'
+            )
+        return server
+
+
+def deploy_sonic_vm(
+        testbed: Testbed,
+        testbed_resources: dict,
+        server_host: TestServer
+    ):
+    """
+    Deploy SONiC VMs for the testbed.
+
+    Args:
+        testbed: Testbed object
+        testbed_resources: Allocated resources for the testbed
+        server_host: Server where VMs will be deployed
+
+    Raises:
+        RuntimeError: If VMs are already running or defined
+    """
+    logger.info(f"Deploying SONiC VMs for testbed '{testbed.name}'")
+
+    # Get DUT information from allocated resources
+    duts = testbed_resources.get('duts', {})
+    if not duts:
+        logger.warning(f"No DUTs found in testbed resources for '{testbed.name}'")
+        return
+
+    # Clean up any existing DUT VMs (destroy and undefine if they exist)
+    with server_host:
+        for dut_name in duts.keys():
+            logger.debug(f"Cleaning up VM '{dut_name}' if it exists")
+
+            # Destroy VM if running (ignore errors if not running)
+            server_host.shell(
+                f"virsh destroy '{dut_name}'",
+                module_ignore_errors=True,
+                task_directives={"become": True}
+            )
+
+            # Undefine VM if defined (ignore errors if not defined)
+            server_host.shell(
+                f"virsh undefine '{dut_name}'",
+                module_ignore_errors=True,
+                task_directives={"become": True}
+            )
+
+    logger.debug(f"VM '{dut_name}' cleanup completed, ready for deployment")
+
+    for dut_name in duts.keys():
+        server_host.virt(
+            name=dut_name,
+            xml="{{ lookup('template', '../roles/vm_set/templates/sonic.xml.j2') }}",
+            command="define",
+            uri="qemu:///system",
+            task_directives={"become": True}
+        )
+        server_host.virt(
+            name=dut_name,
+            state="running",
+            uri="qemu:///system",
+            task_directives={"become": True}
+        )
+
+
+def deploy_ceos_neighbors():
+    pass
+
+
 def deploy_testbed(
         testbed_file: str,
         testbed_name: str,
@@ -175,20 +332,29 @@ def deploy_testbed(
     logger.debug(f"Generating group inventory file for group '{testbed.group}'")
     group_inventory_file = generate_group_inventory_file(testbed.group, refresh=True)
 
-    # Check if the testbed is deployed on any server
-    if server is None:
-        # Server is not specified. Need to find out if the testbed is already deployed on any server
-        logger.info("No server specified, checking existing deployments and selecting optimal server")
-        servers = AnsibleHosts(group_inventory_file, 'server')  # All hosts under children 'server' in the generated inventory file
-        deploy_testbeds = get_all_deployed_testbeds(servers)
+    # Check if the testbed is already deployed on any server in the group
+    servers = AnsibleHosts(group_inventory_file, 'server')
+    deploy_testbeds = get_all_deployed_testbeds(servers)
 
-        # If the testbed is already deployed on any server, raise error
-        for server_name, deployed_testbeds in deploy_testbeds.items():
-            testbeds_on_server = deployed_testbeds.get('testbeds', {})
-            if testbed.name in testbeds_on_server:
-                raise RuntimeError(f"Testbed '{testbed.name}' is already deployed on server '{server_name}'. Please undeploy it first before deploying again.")
+    # Check deployment status and get server if testbed is currently being deployed
+    currently_deploying_on_server = check_testbed_deployment_status(testbed.name, deploy_testbeds)
 
-        # If the testbed is not deployed on any server, select a server to deploy
+    if currently_deploying_on_server is None:
+        logger.info(f"Testbed '{testbed.name}' is not currently deployed on any server, continuing deployment")
+    else:
+        logger.info(f"Testbed '{testbed.name}' has incomplete deployment on server '{currently_deploying_on_server}'")
+
+    # Resolve which server to use for deployment
+    resolved_server = resolve_deployment_server(
+        testbed.name,
+        server,
+        testbed.server,
+        currently_deploying_on_server
+    )
+
+    if resolved_server is None:
+        # Server is not specified anywhere. No previous unfinished deployment. Pick a server automatically.
+        logger.info("No server specified. No previous unfinished deployment. Pick a server automatically.")
         selected_server = pick_server_for_deployment(servers)
 
         if selected_server is None:
@@ -196,23 +362,54 @@ def deploy_testbed(
 
         logger.info(f"Auto-selected server '{selected_server}' for deployment")
     else:
-        logger.info(f"Using specified server '{server}' for deployment")
-        selected_server = server
+        logger.info(f"Using server '{resolved_server}' for deployment")
+        selected_server = resolved_server
 
     # Prepare objects and gather facts for deployment
-    server = TestServer(group_inventory_file, selected_server)
-    localhost = AnsibleLocalhost(group_inventory_file, 'localhost')
+    server_host = TestServer(group_inventory_file, selected_server)
+    localhost = AnsibleLocalhost(group_inventory_file)
 
     # Setup the server (check Ubuntu version, install packages, install Docker, etc.)
     logger.info(f"Setting up server '{selected_server}' before deployment")
-    server.setup_server()
+    server_host.setup_server()
 
     # Allocate testbed index on the server
-    testbed_index = server.allocate_testbed_index(testbed.name)
+    # Testbed name is not stored in the server testbeds file yet, only testbed index is stored for now.
+    # After testbed is fully deployed, we will update the testbeds file with full info, including testbed name.
+    logger.info(f"Allocating testbed index for '{testbed.name}' on server '{selected_server}'")
+    testbed_index = server_host.server_testbeds(
+        operation='allocate',
+        testbeds_json_file=C.SERVER_TESTBEDS_FILE,
+        testbed_name=testbed.name,
+        task_directives={'become': True}
+    ).get('testbed_index')
 
-    # Allocate resources for the testbed
+    topology_definition = get_topology_definition(testbed.topology)
+
+    testbed_resources = allocate_testbed_resources(
+        testbed,
+        testbed_index,
+        topology_definition
+    )
+    logger.info(f"Successfully allocated testbed resources: {json.dumps(testbed_resources, indent=2)}")
+
+    # Generate testbed inventory file
+    logger.info(f"Generating testbed inventory file for '{testbed.name}'")
+    testbed_inventory_file = generate_testbed_inventory_file(
+        testbed=testbed,
+        testbed_resources=testbed_resources,
+        selected_server=selected_server,
+        refresh=True
+    )
+    logger.info(f"Testbed inventory file generated: {testbed_inventory_file}")
 
     # If KVM testbed, bring up the SONiC VM
+    if testbed.type == "kvm":
+        deploy_sonic_vm(testbed, testbed_resources, server_host)
+
+    # if remote type is "ceos", deploy ceos neighbors
+    if neighbor_type == "ceos":
+        deploy_ceos_neighbors()
 
     # Deploy PTF container
 

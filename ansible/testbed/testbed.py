@@ -2,9 +2,15 @@ import json
 import logging
 import os
 import yaml
+from enum import Enum
 
 
 logger = logging.getLogger(__name__)
+
+
+class TestbedType(Enum):
+    PHYSICAL = "physical"
+    KVM = "kvm"
 
 
 # Base class to model a testbed
@@ -14,6 +20,7 @@ class Testbed(object):
             name: str,
             duts: list[str],
             topology: str,
+            testbed_type: str,
             group: str,
             server: str=None,
             ptf_image="docker-ptf",
@@ -27,6 +34,8 @@ class Testbed(object):
 
         # Topology name of the testbed
         self.topology = topology
+
+        self.type = testbed_type
 
         # Devices Under Test (DUTs) in the testbed
         self.duts = duts
@@ -61,6 +70,7 @@ def get_testbed(testbed_src, testbed_name):
         - conf-name: vms-kvm-t0
           group-name: vms6-1
           topo: t0
+          type: kvm
           ptf_image_name: docker-ptf
           ptf: ptf-01
           ptf_ip: 10.250.0.102/24
@@ -76,6 +86,7 @@ def get_testbed(testbed_src, testbed_name):
     New testbed schema:
         - name: vms-kvm-t0
           topology: t0
+          type: kvm
           duts:
               - vlab-01
           group: lab
@@ -113,6 +124,8 @@ def get_testbed(testbed_src, testbed_name):
                     if duts is None:
                         duts = _testbed.get("dut", [])      # for compatible with legacy testbed.yaml schema
 
+                    testbed_type = _testbed.get("type", "physical")
+
                     group = _testbed.get("group", None)
                     if group is None:
                         group = _testbed.get("inv_name")    # for compatible with legacy testbed.yaml schema
@@ -128,6 +141,7 @@ def get_testbed(testbed_src, testbed_name):
                     testbed_definition = {
                         "name": name,
                         "topology": topology,
+                        "testbed_type": testbed_type,
                         "duts": duts,
                         "group": group,
                         "server": server,
@@ -140,6 +154,7 @@ def get_testbed(testbed_src, testbed_name):
         return Testbed(
             name=testbed_definition["name"],
             topology=testbed_definition["topology"],
+            testbed_type=testbed_definition["testbed_type"],
             duts=testbed_definition["duts"],
             group=testbed_definition["group"],
             server=testbed_definition["server"],

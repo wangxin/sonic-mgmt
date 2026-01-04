@@ -156,6 +156,9 @@ class AnsibleHostsBase(object):
         task_directives: dict = {}
     ) -> dict:
 
+        # Validate module name first
+        AnsibleHostsBase._validate_module_name(module_name)
+
         kwargs = copy.deepcopy(kwargs)  # Copy to avoid argument passed by reference issue
         if args:
             kwargs["_raw_params"] = " ".join(args)
@@ -767,7 +770,7 @@ class AnsibleLocalhost(AnsibleHostsBase):
         if not inventory:
             inventory = "/dev/null"  # Ansible accepts this for implicit localhost
 
-        super().__init__(inventory, "localhost", hostvars, localhost_options)
+        super().__init__(inventory=inventory, pattern="localhost", hostvars=hostvars, options=localhost_options)
 
         # Add singular attributes like AnsibleHost
         self.hostname = "localhost"
