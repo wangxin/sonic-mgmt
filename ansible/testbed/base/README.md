@@ -163,6 +163,8 @@ For more examples and guides for how to use this library, please refer to the `d
 * [Logging](docs/logging.md)
 * [task_directives](docs/task_directives.md)
 * Advanced topics
+  * [Asynchronous tasks](docs/async.md)
+  * [Ansible variables](docs/vars.md)
   * [Fork](docs/fork.md)
 
 Possible topics:
