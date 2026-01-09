@@ -1,12 +1,20 @@
 import json
 import logging
+import ipaddress
+import yaml
+
+from pathlib import Path
+from natsort import natsorted
+from jinja2 import Template
 
 from .base import AnsibleHosts
 from .base import AnsibleLocalhost
 from .base import TestServer
 from .config import CONSTANTS as C
 from .testbed import Testbed, get_testbed
-from .inventory import generate_group_inventory_file, generate_testbed_inventory_file
+from .inventory import generate_group_inventory_file
+from .inventory import generate_testbed_inventory_file
+from .inventory import get_ansible_var
 from .topology import get_topology_definition
 from .allocate import allocate_testbed_resources
 
@@ -233,8 +241,9 @@ def resolve_deployment_server(
 def deploy_sonic_vm(
         testbed: Testbed,
         testbed_resources: dict,
-        server_host: TestServer
-    ):
+        server_host: TestServer,
+        localhost: AnsibleLocalhost
+    ) -> dict[str, str]:
     """
     Deploy SONiC VMs for the testbed.
 
@@ -242,6 +251,10 @@ def deploy_sonic_vm(
         testbed: Testbed object
         testbed_resources: Allocated resources for the testbed
         server_host: Server where VMs will be deployed
+        localhost: Ansible localhost object
+
+    Returns:
+        Dictionary mapping DUT names to their sonic_kickstart async job IDs
 
     Raises:
         RuntimeError: If VMs are already running or defined
@@ -252,7 +265,10 @@ def deploy_sonic_vm(
     duts = testbed_resources.get('duts', {})
     if not duts:
         logger.warning(f"No DUTs found in testbed resources for '{testbed.name}'")
-        return
+        return {}
+
+    # Dictionary to store async job IDs for sonic_kickstart tasks
+    kickstart_jids = {}
 
     # Clean up any existing DUT VMs (destroy and undefine if they exist)
     with server_host:
@@ -275,7 +291,61 @@ def deploy_sonic_vm(
 
     logger.debug(f"VM '{dut_name}' cleanup completed, ready for deployment")
 
+    server_home_folder = Path(server_host.shell("echo $HOME")['stdout'].strip())
+    disk_folder = server_home_folder / 'sonic-vm' / 'disks'
+    image_folder = server_home_folder / 'sonic-vm' / 'images'
+
+    # Ensure disk folder exists
+    with server_host:
+        server_host.file(
+            path=str(disk_folder),
+            state="directory",
+            mode="0755",
+        )
+        server_host.file(
+            path=str(image_folder),
+            state="directory",
+            mode="0755",
+        )
+
     for dut_name in duts.keys():
+        # Gather DUT-specific variables
+        dut_hwsku = get_ansible_var(server_host.inventory, dut_name, 'hwsku')
+        asic_type = get_ansible_var(server_host.inventory, dut_name, 'asic_type', default='')
+        dut_num_asics = get_ansible_var(server_host.inventory, dut_name, 'num_asics', default=1)
+        dut_disk_image = Path(server_home_folder) / 'sonic-vm' / 'disks'/ f'sonic_{dut_name}.img'
+        # dut_disk_image = Path('/var/lib/libvirt/images') / f'sonic_{dut_name}.img'
+        port_alias = localhost.port_alias(hwsku=dut_hwsku, num_asic=dut_num_asics)["ansible_facts"]["port_alias"]
+
+        if asic_type == 'vpp':
+            src_disk_image = Path(image_folder) / 'sonic-vpp.img'
+        else:
+            src_disk_image = Path(image_folder) / 'sonic-vs.img'
+
+        # Check if DUT disk image exists on server
+        disk_stat = server_host.stat(path=str(dut_disk_image))
+        if not disk_stat.get('stat', {}).get('exists', False):
+            logger.info(f"DUT disk image '{dut_disk_image}' does not exist, copying from '{src_disk_image}'")
+            server_host.copy(
+                src=str(src_disk_image),
+                dest=str(dut_disk_image),
+                remote_src=True,
+            )
+        else:
+            logger.debug(f"DUT disk image '{dut_disk_image}' already exists, skipping copy")
+
+        # Start sonic kvm vm
+        logger.info(f"Defining and starting SONiC VM '{dut_name}' on server '{server_host.hostname}'")
+        sonic_vm_vars = {
+            "dut_name": dut_name,
+            "hwsku": dut_hwsku,
+            "asic_type": asic_type,
+            "disk_image": dut_disk_image,
+            "serial_port": testbed_resources['duts'][dut_name]['serial_port'],
+            "port_alias": port_alias,
+            "fp_mtu_size": 9216
+        }
+        server_host.update_extra_vars(sonic_vm_vars)
         server_host.virt(
             name=dut_name,
             xml="{{ lookup('template', '../roles/vm_set/templates/sonic.xml.j2') }}",
@@ -290,9 +360,668 @@ def deploy_sonic_vm(
             task_directives={"become": True}
         )
 
+        # Calculate management gateway (first IP in subnet)
+        dut_mgmt_ip = testbed_resources['duts'][dut_name]['ipv4']
+        mgmt_network = ipaddress.ip_network(dut_mgmt_ip, strict=False)
+        mgmt_gw = str(next(mgmt_network.hosts()))
 
-def deploy_ceos_neighbors():
-    pass
+        # Start sonic_kickstart in async mode to configure SONiC VM in background
+        logger.info(f"Starting async sonic_kickstart for '{dut_name}'")
+        kickstart_result = server_host.sonic_kickstart(
+            telnet_port=testbed_resources['duts'][dut_name]['serial_port'],
+            login="{{ sonic_login }}",
+            passwords="{{ sonic_default_passwords }}",
+            hostname=dut_name,
+            mgmt_ip=dut_mgmt_ip,
+            mgmt_gw=mgmt_gw,
+            new_password="{{ sonic_password }}",
+            num_asic=dut_num_asics,
+            task_directives={"async": 600, "poll": 0}
+        )
+
+        # Store the async job ID for later status checking
+        jid = kickstart_result.get('ansible_job_id')
+        if jid:
+            kickstart_jids[dut_name] = jid
+            logger.debug(f"sonic_kickstart for '{dut_name}' started with job ID: {jid}")
+        else:
+            logger.warning(f"No job ID returned for sonic_kickstart on '{dut_name}'")
+
+    logger.info(f"All {len(duts)} SONiC VM(s) deployed and kickstart running in background")
+    return kickstart_jids
+
+
+def deploy_ptf(
+        server_host: TestServer,
+        testbed_resources: dict,
+        ptf_image: str = "docker-ptf:latest",
+        memory: str = "32G",
+        memory_swap: str = "64G",
+    ):
+    """
+    Deploy PTF container on the server.
+
+    Args:
+        server_host: Server where PTF will be deployed
+        testbed_resources: Allocated resources for the testbed
+        ptf_image: PTF image name with tag (e.g., "docker-ptf:latest")
+        memory: Memory limit for container
+        memory_swap: Memory swap limit for container
+    """
+    ptf_name = next(iter(testbed_resources.get('ptf', {})), None)
+    if ptf_name is None:
+        logger.warning("No PTF found in testbed resources, skipping PTF deployment")
+        return
+
+    logger.info(f"Deploying PTF container '{ptf_name}' on server '{server_host.hostname}'")
+
+    # Clean up any existing PTF container (stop and remove if it exists)
+    logger.debug(f"Cleaning up existing PTF container '{ptf_name}' if it exists")
+    with server_host:
+        # Stop container if running (ignore errors if not running)
+        server_host.docker_container(
+            name=ptf_name,
+            state="stopped",
+            task_directives={"become": True, "ignore_errors": True}
+        )
+
+        # Remove container if it exists (ignore errors if not exists)
+        server_host.docker_container(
+            name=ptf_name,
+            state="absent",
+            task_directives={"become": True, "ignore_errors": True}
+        )
+
+    logger.debug(f"PTF container '{ptf_name}' cleanup completed, ready for deployment")
+
+    # Get PTF docker registry from ansible variables
+    ptf_docker_registry = server_host.get_visible_var('ptf_docker_registry', default='')
+
+    # Construct full image path with registry if provided
+    if ptf_docker_registry:
+        full_ptf_image = f"{ptf_docker_registry}/{ptf_image}"
+    else:
+        full_ptf_image = ptf_image
+
+    # Deploy PTF container
+    logger.info(f"Starting PTF container '{ptf_name}' using image '{full_ptf_image}'")
+    server_host.docker_container(
+        name=ptf_name,
+        image=full_ptf_image,
+        pull="always",
+        state="started",
+        restart="no",
+        network_mode="none",
+        detach=True,
+        capabilities=["NET_ADMIN"],
+        privileged=True,
+        memory=memory,
+        memory_swap=memory_swap,
+        task_directives={"become": True}
+    )
+
+    # Post deployment configuration
+    # Configure sysctl settings for PTF container
+    logger.info(f"Configuring sysctl settings for PTF container '{ptf_name}'")
+    sysctl_settings = {
+        "net.ipv6.conf.all.disable_ipv6": "0",
+        "net.ipv6.route.max_size": "168000",
+        "net.ipv6.conf.default.accept_ra": "0"
+    }
+
+    with server_host:
+        for key, value in sysctl_settings.items():
+            server_host.shell(
+                f"docker exec {ptf_name} sysctl -w {key}={value}",
+                task_directives={"become": True}
+            )
+
+        # Ensure /sonic folder exists on PTF container
+        server_host.shell(
+            f"docker exec {ptf_name} mkdir -p /sonic",
+            task_directives={"become": True}
+        )
+
+        # Store DUT type and asic type to PTF container. Some PTF scripts need this information.
+        # For details, please refer to: https://github.com/sonic-net/sonic-mgmt/pull/12588
+        for dut_name in testbed_resources.get('duts', {}).keys():
+            dut_type = get_ansible_var(server_host.inventory, dut_name, 'type', default='')
+            if dut_type:
+                server_host.shell(
+                    f"docker exec {ptf_name} sh -c 'echo {dut_type} > /sonic/dut_type.txt'",
+                    task_directives={"become": True}
+                )
+            asic_type = get_ansible_var(server_host.inventory, dut_name, 'asic_type', default='')
+            if asic_type:
+                server_host.shell(
+                    f"docker exec {ptf_name} sh -c 'echo {asic_type} > /sonic/asic_type.txt'",
+                    task_directives={"become": True}
+                )
+            break  # Only need to check the first DUT
+
+    logger.info(f"PTF container '{ptf_name}' deployed and configured successfully")
+
+
+def deploy_ceos_network_containers(
+        server_host: TestServer,
+        testbed_resources: dict,
+        testbed_name: str,
+        docker_registry: str,
+        net_image: str = "alpine:latest"
+    ):
+    """
+    Deploy network base containers for cEOS neighbors using Docker Compose.
+
+    These containers provide network namespaces that cEOS containers will use.
+    This approach allows setting up veth pairs before cEOS starts, avoiding hot-plug issues.
+
+    Uses Docker Compose for parallel deployment - much faster than sequential container creation.
+
+    Args:
+        server_host: Server where network containers will be deployed
+        testbed_resources: Allocated resources for the testbed
+        testbed_name: Name of the testbed
+        docker_registry: Docker registry URL
+        net_image: Network container image name with tag (e.g., "alpine:latest")
+    """
+    neighbors = testbed_resources.get('neighbors', {})
+    if not neighbors:
+        logger.info("No neighbors found in testbed resources, skipping network container deployment")
+        return
+
+    logger.info(f"Deploying network base containers for {len(neighbors)} neighbor(s) using Docker Compose")
+
+    # Build docker-compose configuration
+    compose_config = {
+        'version': '3.8',
+        'services': {}
+    }
+
+    for neighbor_name in neighbors.keys():
+        net_container_name = f"net_{neighbor_name}"
+
+        compose_config['services'][net_container_name] = {
+            'image': f"{docker_registry}/{net_image}",
+            'container_name': net_container_name,
+            'network_mode': 'none',
+            'privileged': True,
+            'cap_add': ['NET_ADMIN'],
+            'restart': 'no',
+            'command': 'sleep infinity',
+            'mem_limit': '16M'
+        }
+
+    # Convert to YAML and write to server
+    compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
+    compose_file_path = f"/tmp/docker-compose-net-{testbed_name}.yml"
+
+    logger.debug(f"Writing Docker Compose configuration to '{compose_file_path}'")
+    server_host.copy(
+        content=compose_yaml,
+        dest=compose_file_path,
+        mode='0644',
+        task_directives={"become": True}
+    )
+
+    # Stop and remove existing containers using docker compose down
+    logger.debug(f"Cleaning up existing network containers for testbed '{testbed_name}'")
+    server_host.shell(
+        f"docker compose -f {compose_file_path} down",
+        task_directives={"become": True, "ignore_errors": True}
+    )
+
+    # Start all network containers in parallel using docker-compose up
+    logger.info(f"Starting {len(neighbors)} network container(s) in parallel")
+    server_host.shell(
+        f"docker compose -f {compose_file_path} up -d",
+        task_directives={"become": True}
+    )
+
+    logger.info(f"All {len(neighbors)} network base container(s) deployed successfully using Docker Compose")
+
+
+def _build_ceos_image_from_orig(
+        server_host: TestServer,
+        ceos_image_orig: str,
+        ceos_image: str
+    ):
+    """
+    Build final cEOS image from the original image using Dockerfile template.
+
+    Args:
+        server_host: Server where the image will be built
+        ceos_image_orig: Name of the original/base cEOS image
+        ceos_image: Name of the final cEOS image to build
+    """
+    logger.info(f"Building Docker image '{ceos_image}' from '{ceos_image_orig}' using Dockerfile")
+
+    # Create a temporary directory for the build context
+    build_context_dir = f"/tmp/ceos_build_{ceos_image.replace(':', '_').replace('/', '_')}"
+    server_host.file(
+        path=build_context_dir,
+        state="directory",
+        mode="0755",
+        task_directives={"become": True}
+    )
+
+    # Generate Dockerfile from template
+    dockerfile_path = f"{build_context_dir}/Dockerfile"
+    dockerfile_vars = {
+        "ceos_image_orig": ceos_image_orig
+    }
+    server_host.update_extra_vars(dockerfile_vars)
+    server_host.template(
+        src="../roles/vm_set/templates/ceos_dockerfile.j2",
+        dest=dockerfile_path,
+        mode="0644",
+        task_directives={"become": True}
+    )
+
+    # Build the Docker image
+    server_host.docker_image(
+        name=ceos_image,
+        source="build",
+        build={
+            "path": build_context_dir,
+            "pull": False
+        },
+        task_directives={"become": True}
+    )
+
+    # Clean up build context
+    server_host.file(
+        path=build_context_dir,
+        state="absent",
+        task_directives={"become": True}
+    )
+
+    logger.info(f"Successfully built Docker image '{ceos_image}' from '{ceos_image_orig}'")
+
+
+def prepare_ceos_image(server_host: TestServer):
+    """
+    Prepare cEOS image on the server.
+
+    Downloads the cEOS image from specified URLs if it doesn't exist locally,
+    and imports it into Docker.
+
+    Args:
+        server_host: Server where cEOS image will be prepared
+    """
+    logger.info(f"Preparing cEOS image on server '{server_host.hostname}'")
+
+    # Get cEOS image related variables from ansible group vars
+    ceos_image_filename = server_host.get_visible_var('ceos_image_filename')
+    ceos_image_orig = server_host.get_visible_var('ceos_image_orig')
+    ceos_image = server_host.get_visible_var('ceos_image')
+    ceos_image_url = server_host.get_visible_var('ceos_image_url')
+    skip_ceos_image_downloading = server_host.get_visible_var('skip_ceos_image_downloading', default=False)
+
+    # Validate required variables
+    required_vars = {
+        'ceos_image_filename': ceos_image_filename,
+        'ceos_image_orig': ceos_image_orig,
+        'ceos_image': ceos_image,
+        'ceos_image_url': ceos_image_url
+    }
+
+    missing_vars = [var_name for var_name, var_value in required_vars.items() if var_value is None]
+    if missing_vars:
+        raise ValueError(
+            f"Missing required cEOS image variables: {', '.join(missing_vars)}. "
+            f"Please check the 'ansible/group_vars/vm_host/ceos.yml' file."
+        )
+
+    logger.debug(f"cEOS image configuration: filename={ceos_image_filename}, orig={ceos_image_orig}, "
+                 f"image={ceos_image}, urls={ceos_image_url}, skip_downloading={skip_ceos_image_downloading}")
+
+    # Check if the final tagged docker image exists
+    logger.debug(f"Checking if Docker image '{ceos_image}' exists on server")
+    result = server_host.docker_image_info(
+        name=ceos_image,
+        task_directives={"become": True}
+    )
+
+    if result.get('images'):
+        logger.info(f"Docker image '{ceos_image}' already exists, skipping preparation")
+        return
+
+    logger.debug(f"Docker image '{ceos_image}' not found")
+
+    # Check if the original docker image exists
+    logger.debug(f"Checking if Docker image '{ceos_image_orig}' exists on server")
+    result = server_host.docker_image_info(
+        name=ceos_image_orig,
+        task_directives={"become": True}
+    )
+
+    if result.get('images'):
+        logger.info(f"Docker image '{ceos_image_orig}' found, building '{ceos_image}' from it")
+        _build_ceos_image_from_orig(server_host, ceos_image_orig, ceos_image)
+        return
+    else:
+        logger.debug(f"Docker image '{ceos_image_orig}' not found")
+
+        # Check if the cEOS image file exists on server
+        server_home_folder = Path(server_host.shell("echo $HOME")['stdout'].strip())
+        ceos_image_file_path = server_home_folder / 'images' / ceos_image_filename
+
+        logger.debug(f"Checking if cEOS image file '{ceos_image_file_path}' exists on server")
+        file_stat = server_host.stat(path=str(ceos_image_file_path))
+
+        if file_stat.get('stat', {}).get('exists', False):
+            logger.info(f"cEOS image file '{ceos_image_file_path}' found")
+        else:
+            logger.debug(f"cEOS image file '{ceos_image_file_path}' not found")
+            if skip_ceos_image_downloading:
+                raise RuntimeError(
+                    f"cEOS image file '{ceos_image_file_path}' not found on server. "
+                    f"Please manually download the cEOS image and place it at '{ceos_image_file_path}'. "
+                    f"Alternatively, set 'skip_ceos_image_downloading: false' in 'ansible/group_vars/vm_host/ceos.yml' "
+                    f"to enable automatic downloading."
+                )
+
+            # Automatic downloading is enabled, probe URLs to find working one
+            logger.info(f"Probing {len(ceos_image_url)} URL(s) to find working download link")
+            working_url = None
+
+            for url in ceos_image_url:
+                logger.debug(f"Probing URL: {url}")
+                probe_result = server_host.uri(
+                    url=url,
+                    method="HEAD",
+                    status_code=[200, 301, 302],
+                    follow_redirects="safe",
+                    task_directives={"ignore_errors": True}
+                )
+
+                if probe_result.get('status') == 200:
+                    logger.info(f"Found working URL: {url}")
+                    working_url = url
+                    break
+                else:
+                    logger.debug(f"URL {url} returned status {probe_result.get('status', 'unknown')}, skipping")
+
+            if working_url is None:
+                raise RuntimeError(
+                    f"No working download URL found for cEOS image. Tried {len(ceos_image_url)} URL(s). "
+                    f"Please check the URLs defined in 'ansible/group_vars/vm_host/ceos.yml' or "
+                    f"manually download the cEOS image and place it at '{ceos_image_file_path}'."
+                )
+
+            # Ensure images directory exists
+            images_dir = ceos_image_file_path.parent
+            server_host.file(
+                path=str(images_dir),
+                state="directory",
+                mode="0755"
+            )
+
+            # Download the image file from working URL
+            logger.info(f"Downloading cEOS image from {working_url} to {ceos_image_file_path}")
+            server_host.get_url(
+                url=working_url,
+                dest=str(ceos_image_file_path),
+                mode="0644",
+                timeout=1800,  # 30 minutes timeout for large files
+                task_directives={"become": True}
+            )
+            logger.info(f"Successfully downloaded cEOS image to {ceos_image_file_path}")
+
+        # Import the image file into Docker as ceos_image_orig
+        logger.info(f"Importing cEOS image file into Docker as '{ceos_image_orig}'")
+        server_host.docker_image(
+            name=ceos_image_orig,
+            path=str(ceos_image_file_path),
+            source="import",
+            task_directives={"become": True}
+        )
+        logger.info(f"Successfully imported Docker image as '{ceos_image_orig}'")
+
+    # At this point, ceos_image_orig exists but ceos_image does not
+    # Build ceos_image from ceos_image_orig using Dockerfile template
+    _build_ceos_image_from_orig(server_host, ceos_image_orig, ceos_image)
+
+
+def generate_ceos_startup_configs(
+        server_host: TestServer,
+        testbed: Testbed,
+        testbed_resources: dict,
+        topology_definition: dict,
+        neighbor_type: str = "ceos"
+):
+    """
+    Generate startup configuration files for cEOS neighbors.
+
+    Args:
+        server_host: Server where configuration files will be generated
+        testbed: Testbed object
+        testbed_resources: Allocated resources for the testbed
+        topology_definition: Topology definition loaded from vars/topo_*.yml
+        neighbor_type: Type of neighbor devices (default: "ceos")
+    """
+    neighbors = testbed_resources.get('neighbors', {})
+    if not neighbors:
+        logger.info("No neighbors found in testbed resources, skipping cEOS startup config generation")
+        return
+
+    logger.info(f"Generating startup configuration files for {len(neighbors)} cEOS neighbor(s)")
+
+    # Parse base topology from testbed topology name (part before "_")
+    base_topo = testbed.topology.split('_')[0] if '_' in testbed.topology else testbed.topology
+    logger.debug(f"Base topology: {base_topo} (from testbed topology: {testbed.topology})")
+
+    # Get swrole from topology definition
+    swrole = topology_definition.get('configuration_properties', {}).get('common', {}).get('swrole')
+    if swrole:
+        logger.debug(f"Switch role for neighbors: {swrole}")
+    else:
+        logger.warning("No swrole found in topology definition")
+
+# Determine template file name and path
+    template_name = f"{base_topo}-{swrole}.j2"
+    template_dir = Path(__file__).parent.parent / 'roles' / 'eos' / 'templates'
+    template_path = template_dir / template_name
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template file not found: {template_path}")
+
+    logger.debug(f"Using template: {template_path}")
+
+    # Load template content
+    template_content = template_path.read_text()
+    template = Template(template_content)
+
+    # Build mapping between testbed_resources neighbor names and topology_definition neighbor hostnames
+    # Both lists are natsorted to create 1-to-1 mapping
+    neighbor_name_to_hostname = {}
+
+    if topology_definition.get('configuration'):
+        # Get neighbor hostnames from topology definition configurations
+        topo_hostnames = natsorted(topology_definition['configuration'].keys())
+
+        # Get neighbor names from testbed resources
+        neighbor_names = natsorted(neighbors.keys())
+
+        # Create mapping from neighbor name to hostname
+        for neighbor_name, hostname in zip(neighbor_names, topo_hostnames):
+            neighbor_name_to_hostname[neighbor_name] = hostname
+            logger.debug(f"Mapped neighbor '{neighbor_name}' to hostname '{hostname}'")
+
+    # Generate startup config for each neighbor
+    for neighbor_name in neighbors.keys():
+        config_file_path = f"{C.CEOS_IMAGE_MOUNT_DIR}/{neighbor_name}/startup-config"
+
+        # Ensure the mount directory exists
+        mount_dir = f"{C.CEOS_IMAGE_MOUNT_DIR}/{neighbor_name}"
+        server_host.file(
+            path=mount_dir,
+            state="directory",
+            mode="0755",
+            task_directives={"become": True}
+        )
+
+        # Get hostname for this neighbor
+        hostname = neighbor_name_to_hostname.get(neighbor_name)
+        if not hostname:
+            logger.warning(f"No hostname mapping found for neighbor '{neighbor_name}', skipping")
+            continue
+
+        # Prepare template variables (isolated dict, won't affect server_host)
+        template_vars = {
+            'hostname': hostname,
+            'ansible_host': neighbors[neighbor_name]['ipv4'],
+            'vm_type': neighbor_type
+        }
+
+        # Render template locally using Jinja2
+        logger.debug(f"Rendering startup config for '{neighbor_name}' (hostname: {hostname})")
+        config_content = template.render(**template_vars)
+
+        # Write rendered config to server
+        logger.debug(f"Writing startup config to {config_file_path}")
+        server_host.copy(
+            content=config_content,
+            dest=config_file_path,
+            mode="0644",
+            task_directives={"become": True}
+        )
+
+    logger.info(f"Successfully generated startup configs for {len(neighbors)} neighbor(s)")
+
+
+def deploy_ceos_containers(
+        server_host: TestServer,
+        testbed_resources: dict,
+        testbed_name: str,
+        memory: str = "2G",
+        memory_swap: str = "4G"
+    ):
+    """
+    Deploy cEOS neighbor containers using Docker Compose.
+
+    These containers use the network namespace from the net base containers deployed earlier.
+    Uses Docker Compose for parallel deployment.
+
+    Args:
+        server_host: Server where cEOS containers will be deployed
+        testbed_resources: Allocated resources for the testbed
+        testbed_name: Name of the testbed
+        memory: Memory limit for container (default: "2G")
+        memory_swap: Memory swap limit for container (default: "4G")
+    """
+    neighbors = testbed_resources.get('neighbors', {})
+    if not neighbors:
+        logger.info("No neighbors found in testbed resources, skipping cEOS container deployment")
+        return
+
+    # Get cEOS image from ansible variables
+    ceos_image = server_host.get_visible_var('ceos_image')
+    if ceos_image is None:
+        raise ValueError(
+            "Missing required variable 'ceos_image'. "
+            "Please check the 'ansible/group_vars/vm_host/ceos.yml' file."
+        )
+
+    logger.info(f"Deploying cEOS containers for {len(neighbors)} neighbor(s) using Docker Compose with image '{ceos_image}'")
+
+    # Build docker-compose configuration
+    compose_config = {
+        'version': '3.8',
+        'services': {}
+    }
+
+    for neighbor_name in neighbors.keys():
+        ceos_container_name = f"ceos_{neighbor_name}"
+        net_container_name = f"net_{neighbor_name}"
+
+        compose_config['services'][ceos_container_name] = {
+            'image': ceos_image,
+            'container_name': ceos_container_name,
+            'network_mode': f"container:{net_container_name}",
+            'privileged': True,
+            'cap_add': ['NET_ADMIN'],
+            'restart': 'no',
+            'command': '/sbin/init systemd.setenv=INTFTYPE=eth systemd.setenv=ETBA=1 systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1 systemd.setenv=CEOS=1 systemd.setenv=EOS_PLATFORM=ceoslab systemd.setenv=container=docker systemd.setenv=MGMT_INTF=eth0',
+            'environment': {
+                'CEOS': '1',
+                'EOS_PLATFORM': 'ceoslab',
+                'container': 'docker',
+                'ETBA': '1',
+                'SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT': '1',
+                'INTFTYPE': 'eth',
+                'MGMT_INTF': 'eth0'
+            },
+            'volumes': [
+                f"{C.CEOS_IMAGE_MOUNT_DIR}/{neighbor_name}:/mnt/flash"
+            ],
+            'mem_limit': memory,
+            'memswap_limit': memory_swap
+        }
+
+    # Convert to YAML and write to server
+    compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
+    compose_file_path = f"/tmp/docker-compose-ceos-{testbed_name}.yml"
+
+    logger.debug(f"Writing Docker Compose configuration to '{compose_file_path}'")
+    server_host.copy(
+        content=compose_yaml,
+        dest=compose_file_path,
+        mode='0644',
+        task_directives={"become": True}
+    )
+
+    # Stop and remove existing containers using docker compose down
+    logger.debug(f"Cleaning up existing cEOS containers for testbed '{testbed_name}'")
+    server_host.shell(
+        f"docker compose -f {compose_file_path} down",
+        task_directives={"become": True, "ignore_errors": True}
+    )
+
+    # Start all cEOS containers in parallel using docker-compose up
+    logger.info(f"Starting {len(neighbors)} cEOS container(s) in parallel")
+    server_host.shell(
+        f"docker compose -f {compose_file_path} up -d",
+        task_directives={"become": True}
+    )
+
+    logger.info(f"All {len(neighbors)} cEOS container(s) deployed successfully using Docker Compose")
+
+
+def bind_topology_ceos(
+        server_host: TestServer,
+        testbed_resources: dict,
+        topology_definition: dict,
+        neighbor_type: str = "ceos"
+):
+    """
+    Bind topology connections for cEOS neighbor type.
+
+    Creates veth pairs, OVS bridges, and connects all components:
+    - PTF container interfaces
+    - Neighbor (cEOS) container interfaces
+    - KVM DUT interfaces (if applicable)
+
+    Args:
+        server_host: TestServer object representing the target server
+        testbed_resources: Allocated testbed resources dictionary
+        topology_definition: Topology definition loaded from vars/topo_*.yml
+        neighbor_type: Type of neighbor devices (default: "ceos")
+    """
+    logger.info("Binding topology connections for cEOS neighbors")
+
+    result = server_host.testbed_topology(
+        operation='deploy',
+        topology_definition=topology_definition,
+        testbed_resources=testbed_resources,
+        neighbor_type=neighbor_type,
+        task_directives={'become': True}
+    )
+
+    if result.get('failed', False):
+        raise RuntimeError(f"Failed to bind topology: {result.get('msg', 'Unknown error')}")
+
+    logger.info("Topology binding completed successfully")
 
 
 def deploy_testbed(
@@ -311,15 +1040,6 @@ def deploy_testbed(
         server: Target server name (optional, will auto-select if not provided)
     """
     logger.info(f"Starting deployment of testbed '{testbed_name}' from '{testbed_file}'")
-
-    # Is this testbed deployed on any server?
-    # If yes, check deployment status
-        # If status OK, just return
-        # If status not OK, ask user to undeploy firstly
-    # If no, select a server to deploy
-        # Check if the server meets requirements, like have all dependencies installed
-        # Allocate testbed index on this server, allocate PTF of the testbed to this server
-        #
 
     # Initialize the testbed object
     testbed: Testbed = get_testbed(testbed_file, testbed_name)
@@ -403,14 +1123,56 @@ def deploy_testbed(
     )
     logger.info(f"Testbed inventory file generated: {testbed_inventory_file}")
 
+    # Replace server_host with new inventory including testbed DUTs and PTF
+    server_host = TestServer(testbed_inventory_file, selected_server)
+
     # If KVM testbed, bring up the SONiC VM
     if testbed.type == "kvm":
-        deploy_sonic_vm(testbed, testbed_resources, server_host)
-
-    # if remote type is "ceos", deploy ceos neighbors
-    if neighbor_type == "ceos":
-        deploy_ceos_neighbors()
+        deploy_sonic_vm(testbed, testbed_resources, server_host, localhost)
 
     # Deploy PTF container
+    deploy_ptf(
+        server_host,
+        testbed_resources,
+        ptf_image=testbed.ptf_image
+    )
 
-    # Deploy the
+    # Get the server for deploying neighbor devices
+    logger.info(f"Deploying neighbor devices of type '{neighbor_type}' for testbed '{testbed.name}'")
+    # TODO: Add code to prepare server host for neighbor deployment, could be remote server.
+
+    # if neighbor type is "ceos", deploy base net containers for neighbors firstly
+    if neighbor_type == "ceos":
+        deploy_ceos_network_containers(
+            server_host=server_host,
+            testbed_resources=testbed_resources,
+            testbed_name=testbed.name,
+            docker_registry=server_host.get_visible_var('docker_registry', default='')
+        )
+
+    # Bind topology connections between DUTs, PTF, and neighbors
+    if neighbor_type == "ceos":
+        bind_topology_ceos(
+            server_host=server_host,
+            testbed_resources=testbed_resources,
+            topology_definition=topology_definition,
+            neighbor_type=neighbor_type
+        )
+
+    if neighbor_type == "ceos":
+        generate_ceos_startup_configs(
+            server_host=server_host,
+            testbed=testbed,
+            testbed_resources=testbed_resources,
+            topology_definition=topology_definition,
+            neighbor_type=neighbor_type
+        )
+
+    if neighbor_type == "ceos":
+        # Prepare the ceos image on the server
+        prepare_ceos_image(server_host=server_host)
+        deploy_ceos_containers(
+            server_host=server_host,
+            testbed_resources=testbed_resources,
+            testbed_name=testbed.name
+        )

@@ -49,7 +49,7 @@ class Testbed(object):
         self.server = server
 
         # PTF docker image name. If specified, PTF container will be deployed using this image.
-        self.ptf_image_name = ptf_image
+        self.ptf_image = ptf_image
 
         ################################################################################################################
         #### Below are dynamic or runtime attributes                                                                ####

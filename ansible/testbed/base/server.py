@@ -75,10 +75,12 @@ class TestServer(AnsibleHost):
         "22.04": [
             "libvirt-python",
             "docker",
+            "lxml",
         ],
         "24.04": [
             "libvirt-python",
             "docker",
+            "lxml",
         ],
     }
 
@@ -378,9 +380,32 @@ class TestServer(AnsibleHost):
 
         # Add the current user to the docker group to allow docker commands without sudo
         logger.debug(f"Adding user to docker group on {self.hostname}")
-        self.shell("usermod -aG docker $USER && newgrp docker")
+        self.shell("usermod -aG docker $USER && newgrp docker", task_directives={"become": True})
 
-        logger.info(f"Successfully installed Docker on {self.hostname}")
+        # Configure Docker daemon (enable IPv6 and overlay2 storage driver)
+        logger.info(f"Configuring Docker daemon on {self.hostname}")
+        daemon_config = {
+            "ipv6": True,
+            "fixed-cidr-v6": "fd00::/80",
+            "storage-driver": "overlay2"
+        }
+
+        self.copy(
+            content=json.dumps(daemon_config, indent=2),
+            dest="/etc/docker/daemon.json",
+            mode="0644",
+            task_directives={"become": True}
+        )
+
+        # Restart Docker to apply configuration
+        logger.debug(f"Restarting Docker service to apply configuration")
+        self.systemd(
+            name="docker",
+            state="restarted",
+            task_directives={"become": True}
+        )
+
+        logger.info(f"Successfully installed and configured Docker on {self.hostname}")
 
     def setup_server(self, force=False):
         """

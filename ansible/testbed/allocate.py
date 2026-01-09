@@ -60,6 +60,9 @@ def allocate_testbed_resources(
 
     Returns:
         dict: Allocated resources with keys:
+            - 'index': testbed index on the server
+            - 'type': testbed type (e.g., 'kvm', 'physical')
+            - 'topology': topology name (e.g., 't0', 't1')
             - 'bridge': dict mapping bridge name to dict with 'ipv4' and 'ipv6' keys
             - 'duts': dict mapping DUT names to dict with 'ipv4', 'ipv6', and 'serial_port' keys (KVM only)
             - 'ptf': dict mapping PTF name to dict with 'ipv4' and 'ipv6' keys
@@ -152,6 +155,9 @@ def allocate_testbed_resources(
 
     # Build result - only include 'duts' for KVM testbeds
     allocated_resources = {
+        'index': testbed_index,
+        'type': testbed_obj.type,
+        'topology': testbed_obj.topology,
         'bridge': bridge_ips,
         'ptf': ptf_ips,
         'neighbors': vm_ips

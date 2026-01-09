@@ -1,0 +1,1 @@
+../roles/vm_set/library/sonic_kickstart.py

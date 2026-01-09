@@ -2,9 +2,103 @@ import csv
 import ipaddress
 import yaml
 from pathlib import Path
+from typing import Any
+
+from ansible.parsing.dataloader import DataLoader
+from ansible.inventory.manager import InventoryManager
+from ansible.vars.manager import VariableManager
+from ansible.vars.hostvars import HostVars
 
 from .config import CONSTANTS as C
 from .testbed import Testbed
+
+
+# Cache for inventory managers to avoid re-parsing inventory files
+_inventory_cache: dict[tuple, tuple[DataLoader, InventoryManager, VariableManager]] = {}
+
+
+def _get_inventory_cache_key(inventories: str | list[str]) -> tuple:
+    """Generate a cache key from inventory path(s)."""
+    if isinstance(inventories, str):
+        return (inventories,)
+    return tuple(sorted(inventories))
+
+
+def clear_ansible_var_cache() -> None:
+    """Clear the cached inventory managers.
+
+    Call this when inventory files have been modified and need to be re-read.
+    """
+    global _inventory_cache
+    _inventory_cache.clear()
+
+
+def get_ansible_var(
+    inventories: str | list[str],
+    hostname: str,
+    var_name: str,
+    default: Any = None
+) -> Any:
+    """
+    Get an Ansible variable for a specific host from inventory.
+
+    This helper function retrieves variables that are visible to a host,
+    including host_vars, group_vars, inventory vars, and extra_vars.
+
+    Note: Inventory data is cached for performance. If inventory files are modified,
+    call clear_ansible_var_cache() to force re-reading.
+
+    Args:
+        inventories: Inventory file path(s) - can be a single file path or list of paths
+        hostname: Name of the host to get the variable for
+        var_name: Variable name to retrieve
+        default: Default value to return if variable is not found
+
+    Returns:
+        Value of the variable, or default if not found
+
+    Example:
+        # Single inventory file
+        mgmt_ip = get_ansible_var('_INV_GROUP_lab.yml', 'vlab-01', 'ansible_host')
+
+        # Multiple inventory files
+        user = get_ansible_var(
+            ['_INV_GROUP_lab.yml', '_INV_TESTBED_vlab-01.yml'],
+            'vlab-01',
+            'ansible_user',
+            default='admin'
+        )
+
+        # Clear cache if inventory files changed
+        clear_ansible_var_cache()
+    """
+    cache_key = _get_inventory_cache_key(inventories)
+
+    # Check cache first
+    if cache_key not in _inventory_cache:
+        # Not in cache, create new managers
+        loader = DataLoader()
+        inventory = InventoryManager(loader=loader, sources=inventories)
+        variable_manager = VariableManager(loader=loader, inventory=inventory)
+
+        # Trigger ansible to render variables with template expressions
+        HostVars(inventory=inventory, variable_manager=variable_manager, loader=loader)
+
+        # Store in cache
+        _inventory_cache[cache_key] = (loader, inventory, variable_manager)
+
+    # Use cached managers
+    loader, inventory, variable_manager = _inventory_cache[cache_key]
+
+    # Get the host object
+    host = inventory.get_host(hostname)
+    if host is None:
+        return default
+
+    # Get all variables for the host
+    host_vars = variable_manager._hostvars[hostname]
+
+    return host_vars.get(var_name, default)
 
 
 def read_devices_csv(group_name: str) -> list[dict]:
@@ -206,6 +300,7 @@ def generate_testbed_inventory_file(
                 "pdu": {"hosts": {}, "vars": {}},
                 "bmc": {"hosts": {}, "vars": {}},
                 "unknown": {"hosts": {}, "vars": {}},
+                "vm_host": {"children": {"server": {}}},
             },
             "vars": {},
         }
@@ -220,6 +315,7 @@ def generate_testbed_inventory_file(
     # Read group devices and variables (used for both KVM and physical testbeds)
     group_devices = read_devices_csv(testbed.group)
     host_vars = read_host_vars(testbed.group)
+    group_vars = read_group_vars(testbed.group)
 
     # Add selected server to server group
     for device in group_devices:
@@ -257,10 +353,16 @@ def generate_testbed_inventory_file(
             ipv6_obj = ipaddress.ip_interface(dut_ip_dict['ipv6'])
             ipv6_addr = str(ipv6_obj.ip)
 
-            inventory_content['all']['children']['duts']['hosts'][dut_name] = {
+            dut_entry = {
                 'ansible_host': ipv4_addr,
                 'ansible_hostv6': ipv6_addr
             }
+
+            # Add host-specific variables if defined
+            if dut_name in host_vars and host_vars[dut_name]:
+                dut_entry.update(host_vars[dut_name])
+
+            inventory_content['all']['children']['duts']['hosts'][dut_name] = dut_entry
     else:
         # For physical testbeds, get DUT details from group devices
         for device in group_devices:
@@ -323,6 +425,16 @@ def generate_testbed_inventory_file(
         }
 
     #TODO: For fanout, console, pdu, bmc, unknown groups - to be implemented based on conn_graph
+
+    # Add group variables to each group
+    for children_group_name in inventory_content['all']['children']:
+        # Only add vars if this specific group has variables defined
+        if children_group_name in group_vars and group_vars[children_group_name]:
+            inventory_content['all']['children'][children_group_name]['vars'].update(group_vars[children_group_name])
+
+    # Add 'all' group variables
+    if 'all' in group_vars and group_vars['all']:
+        inventory_content['all']['vars'].update(group_vars['all'])
 
     # Write inventory content to YAML file
     with open(inventory_file, 'w') as f:
