@@ -31,6 +31,26 @@ init_plugin_loader()
 logger = logging.getLogger("ansible_pyapi")
 
 
+def _to_native_type(value: Any) -> Any:
+    """Convert Ansible types (AnsibleUnicode, AnsibleUnsafeText, etc.) to native Python types.
+
+    Args:
+        value: Value to convert
+
+    Returns:
+        Native Python type (str, list, dict, etc.)
+    """
+    # Check if value has the Ansible unicode/text types
+    if hasattr(value, '__class__') and value.__class__.__name__ in ('AnsibleUnicode', 'AnsibleUnsafeText'):
+        return str(value)
+    elif isinstance(value, dict):
+        return {k: _to_native_type(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_to_native_type(item) for item in value]
+    else:
+        return value
+
+
 class UnsupportedAnsibleModule(AnsibleError):
     pass
 
@@ -145,7 +165,8 @@ class AnsibleHostsBase(object):
                 f"    Ansible module '{module_name}' is not supported or could not be found.\n"
                 f'    Searched paths: {searched_paths}\n'
                 f'    Please ensure that ANSIBLE_LIBRARY is properly configured.\n'
-                f'    Ref: https://docs.ansible.com/ansible/latest/reference_appendices/config.html#envvar-ANSIBLE_LIBRARY'
+                f'    Ref: https://docs.ansible.com/ansible/latest/reference_appendices/'
+                f'config.html#envvar-ANSIBLE_LIBRARY'
             )
 
     @staticmethod
@@ -251,7 +272,8 @@ class AnsibleHostsBase(object):
             if logger.isEnabledFor(logging.DEBUG) and log_verbosity > 0:
                 for task in tasks:
                     # To honor the ansible's no_log attribute
-                    # Ref: https://docs.ansible.com/ansible/latest/reference_appendices/logging.html#protecting-sensitive-data-with-no-log
+                    # Ref: https://docs.ansible.com/ansible/latest/reference_appendices/
+                    #      logging.html#protecting-sensitive-data-with-no-log
                     no_log = task.get('no_log', False)
 
                     module_name = task['action']['module']
@@ -353,7 +375,10 @@ class AnsibleHostsBase(object):
                 elif log_verbosity >= 3:
                     logger.debug(f'{caller_file}:{caller_line} >> {self.hostnames} => {json.dumps(results, indent=4)}')
                     if log_verbosity >= 4:
-                        logger.debug(f'{caller_file}:{caller_line} >> TaskQueueManager Stats: {json.dumps(_tqm_stats, indent=4)}')
+                        logger.debug(
+                            f'{caller_file}:{caller_line} >> TaskQueueManager Stats: '
+                            f'{json.dumps(_tqm_stats, indent=4)}'
+                        )
 
         finally:
             if tqm:
@@ -484,19 +509,16 @@ class AnsibleHostsBase(object):
         self._batch_results = {}
         return _batch_results
 
-    def get_host_vars(self, hostname: str, var_name: Optional[str] = None, default: Any = None) -> Any:
-        """Get variables directly defined for a specific host.
+    def _get_host_vars_dict(self, hostname: str) -> dict[str, Any]:
+        """Get all variables directly defined for a specific host.
 
         Returns only variables from host_vars/, not group_vars or other sources.
 
         Args:
             hostname: Name of the host to get variables for
-            var_name: Optional specific variable name to retrieve. If None, returns all host vars.
-            default: Default value to return if var_name is not found (only used when var_name is specified)
 
         Returns:
-            If var_name is None: Dictionary of variables directly defined for this host
-            If var_name is specified: Value of the specific variable, or default if not found
+            Dictionary of variables directly defined for this host
 
         Raises:
             KeyError: If hostname is not in the matched hosts
@@ -512,14 +534,29 @@ class AnsibleHostsBase(object):
                 break
 
         # Get host-specific variables (not group vars)
-        host_vars_dict = inv_host.get_vars() if inv_host else {}
+        return inv_host.get_vars() if inv_host else {}
 
-        if var_name is None:
-            return host_vars_dict
-        else:
-            return host_vars_dict.get(var_name, default)
+    def get_host_var(self, hostname: str, var_name: str, default: Any = None) -> Any:
+        """Get a specific variable directly defined for a host.
 
-    def get_visible_vars(self, hostname: str, var_name: Optional[str] = None, default: Any = None) -> Any:
+        Returns only variables from host_vars/, not group_vars or other sources.
+
+        Args:
+            hostname: Name of the host to get variable for
+            var_name: Variable name to retrieve
+            default: Default value to return if variable is not found
+
+        Returns:
+            Value of the specific variable, or default if not found
+
+        Raises:
+            KeyError: If hostname is not in the matched hosts
+        """
+        host_vars_dict = self._get_host_vars_dict(hostname)
+        value = host_vars_dict.get(var_name, default)
+        return _to_native_type(value)
+
+    def _get_visible_vars_dict(self, hostname: str) -> dict[str, Any]:
         """Get all variables visible to a specific host.
 
         Includes host_vars, group_vars, inventory vars, extra_vars.
@@ -527,12 +564,9 @@ class AnsibleHostsBase(object):
 
         Args:
             hostname: Name of the host to get variables for
-            var_name: Optional specific variable name to retrieve. If None, returns all visible vars.
-            default: Default value to return if var_name is not found (only used when var_name is specified)
 
         Returns:
-            If var_name is None: Dictionary of all variables visible to this host (computed/resolved)
-            If var_name is specified: Value of the specific variable, or default if not found
+            Dictionary of all variables visible to this host (computed/resolved)
 
         Raises:
             KeyError: If hostname is not in the matched hosts
@@ -543,12 +577,28 @@ class AnsibleHostsBase(object):
         # Use VariableManager's _hostvars which contains all variables
         # including group vars, inventory vars, and extra vars
         # Templates are automatically rendered
-        visible_vars_dict = dict(self.vm._hostvars[hostname])
+        return dict(self.vm._hostvars[hostname])
 
-        if var_name is None:
-            return visible_vars_dict
-        else:
-            return visible_vars_dict.get(var_name, default)
+    def get_visible_var(self, hostname: str, var_name: str, default: Any = None) -> Any:
+        """Get a specific variable visible to a host.
+
+        Includes host_vars, group_vars, inventory vars, extra_vars.
+        Jinja2 templates are automatically rendered.
+
+        Args:
+            hostname: Name of the host to get variable for
+            var_name: Variable name to retrieve
+            default: Default value to return if variable is not found
+
+        Returns:
+            Value of the specific variable, or default if not found
+
+        Raises:
+            KeyError: If hostname is not in the matched hosts
+        """
+        visible_vars_dict = self._get_visible_vars_dict(hostname)
+        value = visible_vars_dict.get(var_name, default)
+        return _to_native_type(value)
 
     @property
     def extra_vars(self) -> dict[str, Any]:
@@ -660,11 +710,6 @@ class AnsibleHosts(AnsibleHostsBase):
 class AnsibleHost(AnsibleHostsBase):
     """Subclass for working with a single Ansible host."""
 
-    hostname: str
-    ip: Optional[str]
-    v4ip: Optional[str]
-    v6ip: Optional[str]
-
     def __init__(
         self,
         inventory: str | list[str],
@@ -680,7 +725,8 @@ class AnsibleHost(AnsibleHostsBase):
             )
         elif self.hosts_count > 1:
             raise MultipleAnsibleHostsError(
-                f"Expected exactly one host, but '{self.pattern}' matched {self.hosts_count} hosts in inventory '{self.inventory}': {self.hostnames}"
+                f"Expected exactly one host, but '{self.pattern}' matched {self.hosts_count} hosts "
+                f"in inventory '{self.inventory}': {self.hostnames}"
             )
 
         # Add singular attributes for single host access
@@ -689,36 +735,42 @@ class AnsibleHost(AnsibleHostsBase):
         self.v4ip = self.v4ips[0]
         self.v6ip = self.v6ips[0]
 
-    def get_host_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
-        """Get variables directly defined for this host.
+    def get_host_var(self, var_name: str, default: Any = None) -> Any:
+        """Get a specific variable directly defined for this host.
 
         Returns only variables from host_vars/, not group_vars or other sources.
 
         Args:
-            var_name: Optional specific variable name to retrieve. If None, returns all host vars.
-            default: Default value to return if var_name is not found (only used when var_name is specified)
+            var_name: Variable name to retrieve
+            default: Default value to return if variable is not found
 
         Returns:
-            If var_name is None: Dictionary of variables directly defined for this host
-            If var_name is specified: Value of the specific variable, or default if not found
+            Value of the specific variable, or default if not found
         """
-        return super().get_host_vars(self.hostname, var_name, default)
+        return super().get_host_var(self.hostname, var_name, default)
 
-    def get_visible_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
-        """Get all variables visible to this host.
+    def get_visible_var(self, var_name: str, default: Any = None) -> Any:
+        """Get a specific variable visible to this host.
 
         Includes host_vars, group_vars, inventory vars, extra_vars.
         Jinja2 templates are automatically rendered.
 
         Args:
-            var_name: Optional specific variable name to retrieve. If None, returns all visible vars.
-            default: Default value to return if var_name is not found (only used when var_name is specified)
+            var_name: Variable name to retrieve
+            default: Default value to return if variable is not found
 
         Returns:
-            If var_name is None: Dictionary of all variables visible to this host (computed/resolved)
-            If var_name is specified: Value of the specific variable, or default if not found
+            Value of the specific variable, or default if not found
         """
-        return super().get_visible_vars(self.hostname, var_name, default)
+        return super().get_visible_var(self.hostname, var_name, default)
+
+    def update_extra_vars(self, extra_vars: dict[str, Any]) -> None:
+        """Update extra variables for this host.
+
+        Args:
+            extra_vars: Dictionary of variables to add/update in extra_vars
+        """
+        self.vm.extra_vars.update(extra_vars)
 
     @property
     def host_vars(self) -> dict[str, Any]:
@@ -727,7 +779,7 @@ class AnsibleHost(AnsibleHostsBase):
         Returns:
             Dictionary of variables directly defined for this host
         """
-        return self.get_host_vars()
+        return super()._get_host_vars_dict(self.hostname)
 
     @property
     def visible_vars(self) -> dict[str, Any]:
@@ -736,7 +788,7 @@ class AnsibleHost(AnsibleHostsBase):
         Returns:
             Dictionary of all variables visible to this host (computed/resolved)
         """
-        return self.get_visible_vars()
+        return super()._get_visible_vars_dict(self.hostname)
 
     def __str__(self) -> str:
         """Return a user-friendly string representation."""
@@ -775,36 +827,42 @@ class AnsibleLocalhost(AnsibleHostsBase):
         # Add singular attributes like AnsibleHost
         self.hostname = "localhost"
 
-    def get_host_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
-        """Get variables directly defined for localhost.
+    def get_host_var(self, var_name: str, default: Any = None) -> Any:
+        """Get a specific variable directly defined for localhost.
 
         Returns only variables from host_vars/, not group_vars or other sources.
 
         Args:
-            var_name: Optional specific variable name to retrieve. If None, returns all host vars.
-            default: Default value to return if var_name is not found (only used when var_name is specified)
+            var_name: Variable name to retrieve
+            default: Default value to return if variable is not found
 
         Returns:
-            If var_name is None: Dictionary of variables directly defined for localhost
-            If var_name is specified: Value of the specific variable, or default if not found
+            Value of the specific variable, or default if not found
         """
-        return super().get_host_vars(self.hostname, var_name, default)
+        return super().get_host_var(self.hostname, var_name, default)
 
-    def get_visible_vars(self, var_name: Optional[str] = None, default: Any = None) -> Any:
-        """Get all variables visible to localhost.
+    def get_visible_var(self, var_name: str, default: Any = None) -> Any:
+        """Get a specific variable visible to localhost.
 
         Includes host_vars, group_vars, inventory vars, extra_vars.
         Jinja2 templates are automatically rendered.
 
         Args:
-            var_name: Optional specific variable name to retrieve. If None, returns all visible vars.
-            default: Default value to return if var_name is not found (only used when var_name is specified)
+            var_name: Variable name to retrieve
+            default: Default value to return if variable is not found
 
         Returns:
-            If var_name is None: Dictionary of all variables visible to localhost (computed/resolved)
-            If var_name is specified: Value of the specific variable, or default if not found
+            Value of the specific variable, or default if not found
         """
-        return super().get_visible_vars(self.hostname, var_name, default)
+        return super().get_visible_var(self.hostname, var_name, default)
+
+    def update_extra_vars(self, extra_vars: dict[str, Any]) -> None:
+        """Update extra variables for localhost.
+
+        Args:
+            extra_vars: Dictionary of variables to add/update in extra_vars
+        """
+        self.vm.extra_vars.update(extra_vars)
 
     @property
     def host_vars(self) -> dict[str, Any]:
@@ -813,7 +871,7 @@ class AnsibleLocalhost(AnsibleHostsBase):
         Returns:
             Dictionary of variables directly defined for localhost
         """
-        return self.get_host_vars()
+        return super()._get_host_vars_dict(self.hostname)
 
     @property
     def visible_vars(self) -> dict[str, Any]:
@@ -822,7 +880,7 @@ class AnsibleLocalhost(AnsibleHostsBase):
         Returns:
             Dictionary of all variables visible to localhost (computed/resolved)
         """
-        return self.get_visible_vars()
+        return super()._get_visible_vars_dict(self.hostname)
 
     def __str__(self) -> str:
         """Return a user-friendly string representation."""
