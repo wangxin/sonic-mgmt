@@ -301,6 +301,7 @@ def generate_testbed_inventory_file(
                 "bmc": {"hosts": {}, "vars": {}},
                 "unknown": {"hosts": {}, "vars": {}},
                 "vm_host": {"children": {"server": {}}},
+                "sonic": {"children": {"duts": {}}},
             },
             "vars": {},
         }

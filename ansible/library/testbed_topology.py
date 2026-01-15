@@ -35,30 +35,61 @@ options:
     neighbor_type:
         description:
             - Type of neighbor device for topology deployment.
+            - Use 'ceos' for Arista cEOS neighbors.
         type: str
         required: false
+        choices: ['ceos']
 author:
     - Testbed Automation Team
 '''
 
 EXAMPLES = r'''
-# Deploy topology connections
+# Deploy topology connections for KVM testbed
 - name: Deploy testbed topology
   tb_topology:
     operation: deploy
-    neighbor_type: arista
+    neighbor_type: ceos
     topology_definition:
-      duts: []
-      neighbors: []
-      ptf: []
+      topology:
+        VMs:
+          ARISTA01T1:
+            vlans: [0, 1, 2]
+        host_interfaces: [0, 1, 2]
+      configuration:
+        ARISTA01T1:
+          interfaces:
+            Ethernet1: {}
+            Ethernet2: {}
+      configuration_properties:
+        common:
+          nhipv4: 10.10.246.254
     testbed_resources:
-      vcpus: 4
-      memory: 8192
+      type: kvm
+      index: 0
+      ptf:
+        PTF00:
+          ipv4: 192.168.0.1/20
+      duts:
+        vlab-01:
+          fp_ports: ['vlab-01-0', 'vlab-01-1']
+      neighbors:
+        VM00000: {}
+      bridge:
+        br0m:
+          ipv4: 192.168.0.1/20
 
 # Undeploy topology connections
 - name: Undeploy testbed topology
   tb_topology:
     operation: undeploy
+    neighbor_type: ceos
+    testbed_resources:
+      type: kvm
+      index: 0
+      ptf:
+        PTF00: {}
+      neighbors:
+        VM00000: {}
 '''
 
 RETURN = r'''
@@ -78,6 +109,7 @@ topology:
 
 from ansible.module_utils.basic import AnsibleModule
 import asyncio
+import os
 import subprocess
 import docker
 from natsort import natsorted
@@ -93,10 +125,22 @@ class TestbedTopology:
             module: AnsibleModule instance
         """
         self.module = module
+
         self.operation = module.params['operation']
         self.topology_definition = module.params.get('topology_definition', {})
         self.testbed_resources = module.params.get('testbed_resources', {})
         self.neighbor_type = module.params.get('neighbor_type')
+
+        # Build neighbor to VM name mapping
+        topo_config = self.topology_definition.get('topology', {})
+        neighbor_names = natsorted(self.testbed_resources.get('neighbors', {}).keys())
+        vm_names = natsorted(topo_config.get('VMs', {}).keys())
+        self.neighbor_to_vm_name_map = {}
+        self.vm_name_to_neighbor_map = {}
+        for neighbor_name, vm_name in zip(neighbor_names, vm_names):
+            self.neighbor_to_vm_name_map[neighbor_name] = vm_name
+            self.vm_name_to_neighbor_map[vm_name] = neighbor_name
+
         self.docker_client = docker.from_env()
         self.changed = False
         self.msg = ''
@@ -171,7 +215,7 @@ class TestbedTopology:
                 'failed': True
             }
 
-    async def create_veth_to_namespace(self, namespace_pid, veth_external, veth_internal):
+    async def _create_veth_to_namespace(self, namespace_pid, veth_external, veth_internal):
         """Create veth pair and move one end to network namespace.
 
         Args:
@@ -219,21 +263,31 @@ class TestbedTopology:
             f"nsenter -t {namespace_pid} -n ip link set {veth_internal} up"
         )
 
-    async def create_ovs_bridge(self, bridge_name, clear_flows=False):
-        """Create Open vSwitch bridge.
+    async def _create_ovs_bridge_with_ports(self, bridge_name, port_names, clear_flows=False):
+        """Create Open vSwitch bridge and attach all ports in a single command.
+
+        This is more efficient than creating the bridge and adding ports separately,
+        as it executes everything in one ovs-vsctl transaction.
 
         Args:
             bridge_name: Name for the OVS bridge
+            port_names: List of interface names to attach to the bridge
             clear_flows: If True, delete all flows and set secure mode.
                         If False, keep default flows (bridge acts like a normal switch).
 
         Raises:
             subprocess.CalledProcessError: If any command fails
         """
-        # Create OVS bridge (--may-exist makes this idempotent)
-        await self._run(
-            f"ovs-vsctl --may-exist add-br {bridge_name}"
-        )
+        # Build single ovs-vsctl command: create bridge and add all ports
+        # Format: ovs-vsctl --may-exist add-br br0 -- --may-exist add-port br0 port1 -- --may-exist add-port br0 port2 ...
+        cmd_parts = [f"ovs-vsctl --may-exist add-br {bridge_name}"]
+
+        # Add all ports in the same transaction
+        for port_name in port_names:
+            cmd_parts.append(f"-- --may-exist add-port {bridge_name} {port_name}")
+
+        # Execute the combined command
+        await self._run(" ".join(cmd_parts))
 
         if clear_flows:
             # Delete all default flows to prevent any traffic forwarding
@@ -252,22 +306,44 @@ class TestbedTopology:
             f"ip link set {bridge_name} up"
         )
 
-    async def attach_interface_to_bridge(self, bridge_name, interface_name):
-        """Attach a network interface to an OVS bridge.
+    async def _add_flows_to_bridge(self, bridge_name, flows_file_path, clear_existing=True):
+        """Add OpenFlow rules to a bridge from a flows file.
+
+        This method applies OpenFlow rules from a file to the specified bridge.
+        The flows file should contain one flow rule per line in OpenFlow format.
 
         Args:
-            bridge_name: Name of the OVS bridge
-            interface_name: Name of the interface to attach
+            bridge_name: Name of the OVS bridge to add flows to
+            flows_file_path: Path to the file containing OpenFlow rules
+            clear_existing: If True (default), clear all existing flows before adding new ones.
+                          This ensures idempotent behavior and avoids conflicts.
+                          Set to False to append flows to existing ones.
 
         Raises:
-            subprocess.CalledProcessError: If command fails
+            FileNotFoundError: If the flows file does not exist
+            subprocess.CalledProcessError: If the ovs-ofctl command fails
+
+        Example flows file format:
+            in_port=1,actions=output:2
+            in_port=2,actions=output:1
+            priority=100,in_port=3,dl_type=0x0800,actions=output:4
         """
-        # Use --may-exist to make this idempotent
+        # Verify flows file exists
+        if not os.path.exists(flows_file_path):
+            raise FileNotFoundError(f"Flows file not found: {flows_file_path}")
+
+        # Clear existing flows if requested (recommended for idempotent behavior)
+        if clear_existing:
+            await self._run(
+                f"ovs-ofctl del-flows {bridge_name}"
+            )
+
+        # Apply flows from file using ovs-ofctl add-flows
         await self._run(
-            f"ovs-vsctl --may-exist add-port {bridge_name} {interface_name}"
+            f"ovs-ofctl add-flows {bridge_name} {flows_file_path}"
         )
 
-    async def assign_bridge_ip(self, bridge_name, ipv4=None, ipv6=None):
+    async def _assign_bridge_ip(self, bridge_name, ipv4=None, ipv6=None):
         """Assign IP addresses to a bridge interface.
 
         Args:
@@ -304,6 +380,44 @@ class TestbedTopology:
                     f"ip addr add {ipv6} dev {bridge_name}"
                 )
 
+    async def _assign_namespace_interface_ip(self, namespace_pid, interface_name, ipv4=None, ipv6=None):
+        """Assign IP addresses to an interface inside a network namespace.
+
+        Args:
+            namespace_pid: Network namespace ID (container PID)
+            interface_name: Name of the interface inside the namespace
+            ipv4: IPv4 address with prefix (e.g., '192.168.0.20/20')
+            ipv6: IPv6 address with prefix (e.g., 'fd00::20/64')
+
+        Raises:
+            subprocess.CalledProcessError: If command fails
+        """
+        if ipv4:
+            # Check if IPv4 address already assigned
+            check_result = await self._run(
+                f"nsenter -t {namespace_pid} -n ip addr show dev {interface_name} | grep -q '{ipv4}'",
+                check=False,
+                ignore_errors=True
+            )
+            # Only add if not already present
+            if check_result['rc'] != 0:
+                await self._run(
+                    f"nsenter -t {namespace_pid} -n ip addr add {ipv4} dev {interface_name}"
+                )
+
+        if ipv6:
+            # Check if IPv6 address already assigned
+            check_result = await self._run(
+                f"nsenter -t {namespace_pid} -n ip addr show dev {interface_name} | grep -q '{ipv6}'",
+                check=False,
+                ignore_errors=True
+            )
+            # Only add if not already present
+            if check_result['rc'] != 0:
+                await self._run(
+                    f"nsenter -t {namespace_pid} -n ip addr add {ipv6} dev {interface_name}"
+                )
+
     async def _get_container_pid(self, container_name):
         """Get the PID of a Docker container.
 
@@ -321,221 +435,415 @@ class TestbedTopology:
         pid = str(container.attrs['State']['Pid'])
         return pid
 
-    async def deploy(self):
-        """Deploy topology connections.
+    async def _collect_container_pids(self, container_names):
+        """Collect PIDs for given container names.
+
+        Args:
+            container_names: List of container names
 
         Returns:
-            dict: Result dictionary with changed status and message
-
-        Raises:
-            docker.errors.NotFound: If container is not found
-            Exception: If failed to get container PID
+            dict: Mapping from container name to PID
         """
-        # Collect PTF container PID and name
-        ptf_pid = None
-        ptf_name = None
-        ptf_resources = self.testbed_resources.get('ptf', {})
-        if ptf_resources:
-            # Get the first (and typically only) PTF container name
-            ptf_name = list(ptf_resources.keys())[0]
-            ptf_pid = await self._get_container_pid(ptf_name)
+        if not container_names:
+            return {}
 
-        # Collect neighbor container PIDs for ceos neighbor type
-        neighbor_pids = {}
-        if self.neighbor_type == 'ceos':
-            neighbor_resources = self.testbed_resources.get('neighbors', {})
-            neighbor_names = list(neighbor_resources.keys())
-            if neighbor_names:
-                # Get all PIDs concurrently
-                pids = await asyncio.gather(*[
-                    self._get_container_pid(f"net_{neighbor_name}")
-                    for neighbor_name in neighbor_names
-                ])
-                # Map PIDs to neighbor names
-                neighbor_pids = dict(zip(neighbor_names, pids))
+        # Get all PIDs concurrently
+        pids = await asyncio.gather(*[
+            self._get_container_pid(name)
+            for name in container_names
+        ])
 
-        # Build mapping between testbed_resources neighbor names and topology_definition neighbor names
-        # Both lists are natsorted to create 1-to-1 mapping
-        resource_to_topo = {}
-        topo_to_resource = {}
+        # Map container names to PIDs
+        return dict(zip(container_names, pids))
 
-        if self.topology_definition.get('configuration'):
-            # Get neighbor names from topology definition configurations
-            topo_neighbors = natsorted(self.topology_definition['configuration'].keys())
+    def _collect_ptf_interfaces(self):
+        """Collect all PTF interfaces from topology definition.
 
-            # Get neighbor names from testbed resources
-            resource_neighbors = natsorted(self.testbed_resources.get('neighbors', {}).keys())
+        Returns:
+            list: Sorted list of PTF interface numbers
+        """
+        topo_config = self.topology_definition.get('topology', {})
+        host_interfaces = topo_config.get('host_interfaces', [])
+        disabled_host_interfaces = topo_config.get('disabled_host_interfaces', [])
 
-            # Create bidirectional mapping
-            for resource_name, topo_name in zip(resource_neighbors, topo_neighbors):
-                resource_to_topo[resource_name] = topo_name
-                topo_to_resource[topo_name] = resource_name
+        # Collect VLAN interfaces from VMs configuration
+        vms_config = topo_config.get('VMs', {})
+        vlan_interfaces = []
+        for vm_config in vms_config.values():
+            vlan_interfaces.extend(vm_config.get('vlans', []))
 
-        # Get testbed index for bridge names
-        testbed_index = self.testbed_resources.get('index')
+        # Combine all PTF dataplane interfaces and return sorted
+        return sorted(set(host_interfaces + disabled_host_interfaces + vlan_interfaces))
 
-        # Prepare veth creation and interface attachment arguments together
+    def _get_ptf_interface_names(self, ptf_name, all_ptf_interfaces):
+        """Get list of PTF interface names (veth external sides).
+
+        Args:
+            ptf_name: PTF container name
+            all_ptf_interfaces: Sorted list of PTF interface numbers
+
+        Returns:
+            dict: {
+                'management': 'PTF00-m',
+                'dataplane': ['PTF00-0', 'PTF00-1', ...],
+                'backplane': 'PTF00-b'
+            }
+        """
+        if not ptf_name:
+            return {'management': None, 'dataplane': [], 'backplane': None}
+
+        return {
+            'management': f"{ptf_name}-m",
+            'dataplane': [f"{ptf_name}-{i}" for i in all_ptf_interfaces],
+            'backplane': f"{ptf_name}-b"
+        }
+
+    def _get_neighbor_interface_names(self, neighbor_name):
+        """Get list of neighbor interface names for a single neighbor.
+
+        Args:
+            neighbor_name: Neighbor container name (e.g., 'VM00000')
+
+        Returns:
+            dict: {
+                'management': 'VM00000-m',
+                'dataplane': ['VM00000-t0', 'VM00000-t1', ...],
+                'backplane': 'VM00000-b'
+            }
+        """
+        vm_name = self.neighbor_to_vm_name_map.get(neighbor_name)
+        if not vm_name:
+            return {'management': None, 'dataplane': [], 'backplane': None}
+
+        neighbor_config = self.topology_definition.get('configuration', {}).get(vm_name, {})
+        interfaces = neighbor_config.get('interfaces', {})
+
+        # Find max interface number
+        max_interface_num = 0
+        for interface_name in interfaces.keys():
+            if interface_name.startswith('Ethernet'):
+                interface_num_int = int(interface_name.replace('Ethernet', ''))
+                max_interface_num = max(max_interface_num, interface_num_int)
+
+        return {
+            'management': f"{neighbor_name}-m",
+            'dataplane': [f"{neighbor_name}-t{i-1}" for i in range(1, max_interface_num + 1)],
+            'backplane': f"{neighbor_name}-b"
+        }
+
+    def _get_all_neighbor_interface_names(self):
+        """Get all neighbor interface names from testbed resources.
+
+        Returns:
+            dict: Mapping from neighbor names to their interface names.
+                Format: {
+                    'VM00000': {'management': 'VM00000-m', 'dataplane': [...], 'backplane': 'VM00000-b'},
+                    ...
+                }
+        """
+        all_neighbor_interface_names = {}
+
+        if self.neighbor_type != 'ceos':
+            return all_neighbor_interface_names
+
+        neighbor_resources = self.testbed_resources.get('neighbors', {})
+        for neighbor_name in neighbor_resources.keys():
+            neighbor_interface_names = self._get_neighbor_interface_names(neighbor_name)
+            if neighbor_interface_names['management']:  # Only add if valid
+                all_neighbor_interface_names[neighbor_name] = neighbor_interface_names
+
+        return all_neighbor_interface_names
+
+    def _get_dut_interface_names(self):
+        """Get all DUT interface names from testbed resources.
+
+        Returns:
+            dict: Mapping from DUT names to their interface names.
+                Format: {
+                    'vlab-01': {'management': 'vlab-01-m', 'dataplane': ['vlab-01-0', ...]},
+                    ...
+                }
+        """
+        dut_interface_names = {}
+
+        if self.testbed_resources.get('type') != 'kvm':
+            return dut_interface_names
+
+        dut_resources = self.testbed_resources.get('duts', {})
+        for dut_name, dut_config in dut_resources.items():
+            fp_ports = dut_config.get('fp_ports', [])
+            dut_interface_names[dut_name] = {
+                'management': f"{dut_name}-m",
+                'dataplane': fp_ports
+            }
+
+        return dut_interface_names
+
+    def _build_ptf_interface_args(self, ptf_pid, ptf_interface_names, testbed_index):
+        """Build veth creation and interface attachment arguments for PTF container.
+
+        Args:
+            ptf_pid: PTF container PID
+            ptf_interface_names: Dict with PTF interface names ({'management': str, 'dataplane': list, 'backplane': str})
+            testbed_index: Testbed index for bridge names
+
+        Returns:
+            tuple: (veth_creation_args, interface_attachment_args)
+        """
         veth_creation_args = []
         interface_attachment_args = []
 
-        # Process PTF container interfaces
-        if ptf_pid and ptf_name:
-            # Management interface
-            veth_external = f"{ptf_name}-m"
+        if not ptf_pid:
+            return veth_creation_args, interface_attachment_args
+
+        # Management interface
+        if ptf_interface_names['management']:
             veth_creation_args.append({
                 'namespace_pid': ptf_pid,
-                'veth_external': veth_external,
+                'veth_external': ptf_interface_names['management'],
                 'veth_internal': 'mgmt'
             })
             interface_attachment_args.append({
                 'bridge_name': f"br{testbed_index}m",
+                'interface_name': ptf_interface_names['management']
+            })
+
+        # Data plane interfaces
+        for idx, veth_external in enumerate(ptf_interface_names['dataplane']):
+            veth_creation_args.append({
+                'namespace_pid': ptf_pid,
+                'veth_external': veth_external,
+                'veth_internal': f"eth{idx}"
+            })
+            interface_attachment_args.append({
+                'bridge_name': f"br{testbed_index}d",
                 'interface_name': veth_external
             })
 
-            # Data plane interfaces based on topology definition
-            topo_config = self.topology_definition.get('topology', {})
-            host_interfaces = topo_config.get('host_interfaces', [])
-            disabled_host_interfaces = topo_config.get('disabled_host_interfaces', [])
+        # Backplane interface
+        if ptf_interface_names['backplane']:
+            veth_creation_args.append({
+                'namespace_pid': ptf_pid,
+                'veth_external': ptf_interface_names['backplane'],
+                'veth_internal': 'backplane'
+            })
+            interface_attachment_args.append({
+                'bridge_name': f"br{testbed_index}b",
+                'interface_name': ptf_interface_names['backplane']
+            })
 
-            # Collect VLAN interfaces from VMs configuration
-            vms_config = topo_config.get('VMs', {})
-            vlan_interfaces = []
-            for vm_config in vms_config.values():
-                vlan_interfaces.extend(vm_config.get('vlans', []))
+        return veth_creation_args, interface_attachment_args
 
-            # Combine all PTF dataplane interfaces
-            all_ptf_interfaces = set(host_interfaces + disabled_host_interfaces + vlan_interfaces)
+    def _build_dut_interface_args(self, dut_interface_names, testbed_index):
+        """Build interface attachment arguments for KVM DUT.
 
-            for interface_num in all_ptf_interfaces:
-                veth_external = f"{ptf_name}-{interface_num}"
+        Args:
+            dut_interface_names: Dict mapping DUT names to their interface names
+                Format: {
+                    'vlab-01': {'management': 'vlab-01-m', 'dataplane': ['vlab-01-0', ...]},
+                    ...
+                }
+            testbed_index: Testbed index for bridge names
+
+        Returns:
+            list: interface_attachment_args
+        """
+        interface_attachment_args = []
+
+        for dut_name, interface_names in dut_interface_names.items():
+            # Management interface
+            if interface_names['management']:
+                interface_attachment_args.append({
+                    'bridge_name': f"br{testbed_index}m",
+                    'interface_name': interface_names['management']
+                })
+
+            # Dataplane interfaces
+            for port_name in interface_names['dataplane']:
+                interface_attachment_args.append({
+                    'bridge_name': f"br{testbed_index}d",
+                    'interface_name': port_name
+                })
+
+        return interface_attachment_args
+
+    def _build_neighbor_interface_args(self, neighbor_pids, neighbor_interface_names, testbed_index):
+        """Build veth creation and interface attachment arguments for neighbor containers.
+
+        Args:
+            neighbor_pids: Dict mapping neighbor names to PIDs
+            neighbor_interface_names: Dict mapping neighbor names to their interface names
+                Format: {
+                    'VM00000': {'management': 'VM00000-m', 'dataplane': [...], 'backplane': 'VM00000-b'},
+                    ...
+                }
+            testbed_index: Testbed index for bridge names
+
+        Returns:
+            tuple: (veth_creation_args, interface_attachment_args)
+        """
+        veth_creation_args = []
+        interface_attachment_args = []
+
+        for neighbor_name, neighbor_pid in neighbor_pids.items():
+            # Get VM name and interface names
+            vm_name = self.neighbor_to_vm_name_map.get(neighbor_name)
+            if not vm_name:
+                continue
+
+            interface_names = neighbor_interface_names.get(neighbor_name)
+            if not interface_names:
+                continue
+
+            # Management interface
+            if interface_names['management']:
                 veth_creation_args.append({
-                    'namespace_pid': ptf_pid,
+                    'namespace_pid': neighbor_pid,
+                    'veth_external': interface_names['management'],
+                    'veth_internal': 'eth0'
+                })
+                interface_attachment_args.append({
+                    'bridge_name': f"br{testbed_index}m",
+                    'interface_name': interface_names['management']
+                })
+
+            # Dataplane interfaces (VM00000-t0 → eth1, VM00000-t1 → eth2, etc.)
+            for idx, veth_external in enumerate(interface_names['dataplane']):
+                veth_creation_args.append({
+                    'namespace_pid': neighbor_pid,
                     'veth_external': veth_external,
-                    'veth_internal': f"eth{interface_num}"
+                    'veth_internal': f"eth{idx+1}"
                 })
                 interface_attachment_args.append({
                     'bridge_name': f"br{testbed_index}d",
                     'interface_name': veth_external
                 })
 
-            # Backplane interface
-            veth_external = f"{ptf_name}-b"
-            veth_creation_args.append({
-                'namespace_pid': ptf_pid,
-                'veth_external': veth_external,
-                'veth_internal': 'backplane'
-            })
-            interface_attachment_args.append({
-                'bridge_name': f"br{testbed_index}b",
-                'interface_name': veth_external
-            })
-
-        # Process KVM DUT interfaces (no veth creation, only attachment)
-        if self.testbed_resources.get('type') == 'kvm':
-            dut_resources = self.testbed_resources.get('duts', {})
-
-            for dut_name in dut_resources.keys():
-                # Management interface: {dut_name}-0
-                interface_attachment_args.append({
-                    'bridge_name': f"br{testbed_index}m",
-                    'interface_name': f"{dut_name}-0"
-                })
-
-                # Dataplane interfaces: {dut_name}-1, {dut_name}-2, etc.
-                # DUT interfaces correspond to PTF interfaces: {dut_name}-1 -> PTF eth0, {dut_name}-2 -> PTF eth1, etc.
-                for idx, ptf_interface_num in enumerate(sorted(all_ptf_interfaces), start=1):
-                    interface_attachment_args.append({
-                        'bridge_name': f"br{testbed_index}d",
-                        'interface_name': f"{dut_name}-{idx}"
-                    })
-
-        # Process neighbor container interfaces
-        for neighbor_name, neighbor_pid in neighbor_pids.items():
-            # Management interface
-            veth_external = f"{neighbor_name}-m"
-            veth_creation_args.append({
-                'namespace_pid': neighbor_pid,
-                'veth_external': veth_external,
-                'veth_internal': 'eth0'
-            })
-            interface_attachment_args.append({
-                'bridge_name': f"br{testbed_index}m",
-                'interface_name': veth_external
-            })
-
-            # Data plane and backplane interfaces
-            vm_name = resource_to_topo.get(neighbor_name)
-            if vm_name:
-                neighbor_config = self.topology_definition.get('configuration', {}).get(vm_name, {})
-                interfaces = neighbor_config.get('interfaces', {})
-
-                # Process all Ethernet interfaces and track max interface number
-                max_interface_num = 0
-                for interface_name in interfaces.keys():
-                    if interface_name.startswith('Ethernet'):
-                        interface_num = interface_name.replace('Ethernet', '')
-                        interface_num_int = int(interface_num)
-                        max_interface_num = max(max_interface_num, interface_num_int)
-
-                        # Dataplane interface
-                        veth_external = f"{neighbor_name}-t{interface_num_int - 1}"
-                        veth_creation_args.append({
-                            'namespace_pid': neighbor_pid,
-                            'veth_external': veth_external,
-                            'veth_internal': f"eth{interface_num}"
-                        })
-                        interface_attachment_args.append({
-                            'bridge_name': f"br{testbed_index}d",
-                            'interface_name': veth_external
-                        })
-
-                # Backplane interface
-                backplane_interface_num = max_interface_num + 1
-                veth_external = f"{neighbor_name}-b"
+            # Backplane interface (next eth after dataplane interfaces)
+            if interface_names['backplane']:
+                backplane_interface_num = len(interface_names['dataplane']) + 1
                 veth_creation_args.append({
                     'namespace_pid': neighbor_pid,
-                    'veth_external': veth_external,
+                    'veth_external': interface_names['backplane'],
                     'veth_internal': f"eth{backplane_interface_num}"
                 })
                 interface_attachment_args.append({
                     'bridge_name': f"br{testbed_index}b",
-                    'interface_name': veth_external
+                    'interface_name': interface_names['backplane']
                 })
 
-        # Create veth pairs and attach to namespaces concurrently
-        await asyncio.gather(*[
-            self.create_veth_to_namespace(**veth_args)
-            for veth_args in veth_creation_args
-        ])
+        return veth_creation_args, interface_attachment_args
 
-        # Prepare OVS bridge creation arguments
+    async def _create_ovs_bridges(self, interface_attachment_args, testbed_index):
+        """Create OVS bridges and attach all interfaces.
+
+        Args:
+            interface_attachment_args: List of interface attachment arguments
+            testbed_index: Testbed index for bridge names
+        """
+        # Group interface attachments by bridge name
+        bridge_ports = {
+            f"br{testbed_index}m": [],
+            f"br{testbed_index}b": [],
+            f"br{testbed_index}d": []
+        }
+
+        for attachment in interface_attachment_args:
+            bridge_name = attachment['bridge_name']
+            interface_name = attachment['interface_name']
+            bridge_ports[bridge_name].append(interface_name)
+
+        # Prepare OVS bridge creation with ports arguments
         bridge_creation_args = []
 
         # Management bridge (no flow clearing - acts like normal switch)
         bridge_creation_args.append({
             'bridge_name': f"br{testbed_index}m",
+            'port_names': bridge_ports[f"br{testbed_index}m"],
             'clear_flows': False
         })
 
         # Backplane bridge (no flow clearing - acts like normal switch)
         bridge_creation_args.append({
             'bridge_name': f"br{testbed_index}b",
+            'port_names': bridge_ports[f"br{testbed_index}b"],
             'clear_flows': False
         })
 
         # Dataplane bridge (clear flows - explicit flow control)
         bridge_creation_args.append({
             'bridge_name': f"br{testbed_index}d",
+            'port_names': bridge_ports[f"br{testbed_index}d"],
             'clear_flows': True
         })
 
-        # Create OVS bridges concurrently
+        # Create OVS bridges with all ports in single command per bridge (concurrent)
         await asyncio.gather(*[
-            self.create_ovs_bridge(**bridge_args)
+            self._create_ovs_bridge_with_ports(**bridge_args)
             for bridge_args in bridge_creation_args
         ])
 
-        # Assign IP addresses to bridges
+    def _build_openflow_rule(self, rule_dict, priority=100):
+        """Build an OpenFlow rule string from a rule dictionary.
+
+        Args:
+            rule_dict: Dictionary with format:
+                {
+                    "in_port": "vlab-01-29",
+                    "vlan": 129,  # Could be None
+                    "vlan_action": "pop",  # Could be "push", "pop" or None.
+                    "out_ports": ["PTF00-29", "VM00000-t0"],  # Must be a list
+                    "priority": 100  # Optional, defaults to method parameter if not specified
+                }
+            priority: Default flow rule priority if not specified in rule_dict (default 100)
+
+        Returns:
+            str: OpenFlow rule string
+
+        Examples:
+            With VLAN pop:
+                Input: {"in_port": "vlab-01-29", "vlan": 129, "vlan_action": "pop",
+                        "out_ports": ["PTF00-29", "VM00000-t0"]}
+                Output: "priority=100,in_port=vlab-01-29,dl_vlan=129,actions=strip_vlan,output:PTF00-29,output:VM00000-t0"
+
+            Without VLAN:
+                Input: {"in_port": "vlab-01-29", "vlan": None, "vlan_action": None,
+                        "out_ports": ["PTF00-29", "VM00000-t0"]}
+                Output: "priority=100,in_port=vlab-01-29,actions=output:PTF00-29,output:VM00000-t0"
+        """
+        in_port = rule_dict.get("in_port")
+        vlan = rule_dict.get("vlan")
+        vlan_action = rule_dict.get("vlan_action")
+        out_ports = rule_dict.get("out_ports", [])
+        rule_priority = rule_dict.get("priority", priority)
+
+        # Build match criteria
+        match_parts = [f"priority={rule_priority}", f"in_port={in_port}"]
+
+        if vlan is not None:
+            match_parts.append(f"dl_vlan={vlan}")
+
+        # Build actions
+        actions = []
+
+        if vlan is not None and vlan_action:
+            if vlan_action == "pop":
+                actions.append("strip_vlan")
+            elif vlan_action == "push":
+                actions.append("set_vlan_id")
+
+        # Add output actions for all output ports
+        for out_port in out_ports:
+            actions.append(f"output:{out_port}")
+
+        # Combine match and actions
+        match_str = ",".join(match_parts)
+        actions_str = ",".join(actions)
+
+        return f"{match_str},actions={actions_str}"
+
+    async def _assign_bridge_ips(self):
+        """Assign IP addresses to bridges."""
         bridge_ip_args = []
         bridge_resources = self.testbed_resources.get('bridge', {})
         for bridge_name, ip_config in bridge_resources.items():
@@ -546,15 +854,282 @@ class TestbedTopology:
             })
 
         await asyncio.gather(*[
-            self.assign_bridge_ip(**ip_args)
+            self._assign_bridge_ip(**ip_args)
             for ip_args in bridge_ip_args
         ])
 
-        # Attach all interfaces to bridges concurrently
+    def _build_dataplane_flows(self, ptf_interface_names, dut_interface_names, neighbor_interface_names):
+        """Build OpenFlow rule dictionaries for dataplane bridge.
+
+        Args:
+            ptf_interface_names: Dict with PTF interface names
+            dut_interface_names: Dict mapping DUT names to their interface names
+            neighbor_interface_names: Dict mapping neighbor names to their interface names
+
+        Returns:
+            list: List of OpenFlow rule dictionaries
+        """
+        topo_config = self.topology_definition.get('topology', {})
+        host_interfaces = topo_config.get('host_interfaces', [])
+        testbed_type = self.testbed_resources.get('type')
+
+        openflow_rules = []
+
+        # Skip if testbed type is not kvm
+        if testbed_type != 'kvm':
+            return openflow_rules
+
+        # Build mapping from port_index to PTF port name for quick lookup
+        ptf_port_map = {idx: port_name for idx, port_name in enumerate(ptf_interface_names['dataplane'])}
+
+        # Get first DUT for the rules
+        dut_names = natsorted(dut_interface_names.keys())
+        if not dut_names:
+            return openflow_rules
+
+        first_dut = dut_names[0]
+        first_dut_ports = dut_interface_names[first_dut]['dataplane']
+
+        # Loop through host interfaces
+        for host_interface in host_interfaces:
+            # Skip if not an integer (for dualtor)
+            if not isinstance(host_interface, int):
+                continue
+
+            port_index = host_interface
+
+            # Get PTF and DUT port names
+            ptf_port_name = ptf_port_map.get(port_index)
+            dut_port_name = first_dut_ports[port_index] if port_index < len(first_dut_ports) else None
+
+            if ptf_port_name and dut_port_name:
+                # Rule 1: PTF -> DUT (no VLAN)
+                openflow_rules.append({
+                    'in_port': ptf_port_name,
+                    'vlan': None,
+                    'vlan_action': None,
+                    'out_ports': [dut_port_name]
+                })
+
+                # Rule 2: DUT -> PTF (no VLAN)
+                openflow_rules.append({
+                    'in_port': dut_port_name,
+                    'vlan': None,
+                    'vlan_action': None,
+                    'out_ports': [ptf_port_name]
+                })
+
+        # Loop through VMs in topology
+        vms_config = topo_config.get('VMs', {})
+        for vm_name, vm_config in vms_config.items():
+            neighbor_name = self.vm_name_to_neighbor_map.get(vm_name)
+            neighbor_port_list = neighbor_interface_names.get(neighbor_name, {}).get('dataplane', [])
+            vlans = vm_config.get('vlans', [])
+
+            # Loop through VLAN port indices
+            for idx, port_index in enumerate(vlans):
+                # Skip if not an integer (for dualtor)
+                if not isinstance(port_index, int):
+                    continue
+
+                ptf_port_name = ptf_port_map.get(port_index)
+                dut_port_name = first_dut_ports[port_index] if port_index < len(first_dut_ports) else None
+                neighbor_port_name = neighbor_port_list[idx] if idx < len(neighbor_port_list) else None
+
+                openflow_rules.append({
+                    'in_port': dut_port_name,
+                    'vlan': None,
+                    'vlan_action': None,
+                    'out_ports': [ptf_port_name, neighbor_port_name]
+                })
+                openflow_rules.append({
+                    'in_port': ptf_port_name,
+                    'vlan': None,
+                    'vlan_action': None,
+                    'out_ports': [dut_port_name]
+                })
+                openflow_rules.append({
+                    'in_port': neighbor_port_name,
+                    'vlan': None,
+                    'vlan_action': None,
+                    'out_ports': [dut_port_name]
+                })
+
+        return openflow_rules
+
+    async def _apply_dataplane_flows(self, openflow_rules, testbed_index):
+        """Convert OpenFlow rule dicts to strings, save to file, and apply to bridge.
+
+        Args:
+            openflow_rules: List of OpenFlow rule dictionaries
+            testbed_index: Testbed index for bridge and file naming
+        """
+        if not openflow_rules:
+            return
+
+        # Convert rule dicts to rule strings and save to file
+        flows_file_path = f"/tmp/br{testbed_index}d_flows.txt"
+        with open(flows_file_path, 'w') as f:
+            for rule_dict in openflow_rules:
+                rule_string = self._build_openflow_rule(rule_dict)
+                f.write(rule_string + '\n')
+
+        # Add OpenFlow rules to dataplane bridge
+        await self._add_flows_to_bridge(f"br{testbed_index}d", flows_file_path)
+
+    async def _assign_ptf_interface_ips(self, ptf_pid, ptf_name):
+        """Assign IP addresses to PTF interfaces.
+
+        Args:
+            ptf_pid: PTF container PID
+            ptf_name: PTF container name
+        """
+        ptf_interface_ip_args = []
+
+        if not (ptf_pid and ptf_name):
+            return
+
+        # Management interface IP assignment
+        ptf_resources = self.testbed_resources.get('ptf', {})
+        ptf_ip_config = ptf_resources.get(ptf_name, {})
+        if ptf_ip_config:
+            ptf_interface_ip_args.append({
+                'namespace_pid': ptf_pid,
+                'interface_name': 'mgmt',
+                'ipv4': ptf_ip_config.get('ipv4'),
+                'ipv6': ptf_ip_config.get('ipv6')
+            })
+
+        # Backplane interface IP assignment
+        # Get PTF backplane IP addresses from topology definition (without prefix length)
+        # These are stored in configuration_properties.common.nhipv4 and nhipv6
+        config_props = self.topology_definition.get('configuration_properties', {})
+        common_props = config_props.get('common', {})
+        bp_ipv4_addr = common_props.get('nhipv4')
+        bp_ipv6_addr = common_props.get('nhipv6')
+
+        # Extract prefix lengths from VM bp_interface configuration
+        # Note: We only use the PREFIX LENGTH from VM bp_interface, not the IP address
+        # The actual PTF IP comes from nhipv4/nhipv6 above
+        vm_configs = self.topology_definition.get('configuration', {})
+        bp_ipv4_prefix = None
+        bp_ipv6_prefix = None
+
+        for vm_config in vm_configs.values():
+            bp_interface = vm_config.get('bp_interface', {})
+            if bp_interface:
+                # Extract only the prefix length (e.g., "24" from "10.10.246.29/24")
+                if not bp_ipv4_prefix and bp_interface.get('ipv4'):
+                    bp_ipv4_with_prefix = bp_interface['ipv4']
+                    bp_ipv4_prefix = bp_ipv4_with_prefix.split('/')[-1] if '/' in bp_ipv4_with_prefix else None
+
+                if not bp_ipv6_prefix and bp_interface.get('ipv6'):
+                    bp_ipv6_with_prefix = bp_interface['ipv6']
+                    bp_ipv6_prefix = bp_ipv6_with_prefix.split('/')[-1] if '/' in bp_ipv6_with_prefix else None
+
+                # Break if we found both prefix lengths
+                if bp_ipv4_prefix and bp_ipv6_prefix:
+                    break
+
+        # Construct PTF backplane IP addresses by combining nhipv4/nhipv6 with prefix lengths
+        ptf_bp_ipv4 = f"{bp_ipv4_addr}/{bp_ipv4_prefix}" if bp_ipv4_addr and bp_ipv4_prefix else None
+        ptf_bp_ipv6 = f"{bp_ipv6_addr}/{bp_ipv6_prefix}" if bp_ipv6_addr and bp_ipv6_prefix else None
+
+        if ptf_bp_ipv4 or ptf_bp_ipv6:
+            ptf_interface_ip_args.append({
+                'namespace_pid': ptf_pid,
+                'interface_name': 'backplane',
+                'ipv4': ptf_bp_ipv4,
+                'ipv6': ptf_bp_ipv6
+            })
+
+        # Assign all PTF interface IPs concurrently
         await asyncio.gather(*[
-            self.attach_interface_to_bridge(**attachment_args)
-            for attachment_args in interface_attachment_args
+            self._assign_namespace_interface_ip(**ip_args)
+            for ip_args in ptf_interface_ip_args
         ])
+
+    async def deploy(self):
+        """Deploy topology connections.
+
+        Returns:
+            dict: Result dictionary with changed status and message
+
+        Raises:
+            docker.errors.NotFound: If container is not found
+            Exception: If failed to get container PID
+        """
+        # Get testbed index for later use
+        testbed_index = self.testbed_resources.get('index')
+
+        # Collect container names from resources
+        ptf_name = None
+        ptf_resources = self.testbed_resources.get('ptf', {})
+        if ptf_resources:
+            ptf_name = list(ptf_resources.keys())[0]
+
+        neighbor_names = []
+        if self.neighbor_type == 'ceos':
+            neighbor_resources = self.testbed_resources.get('neighbors', {})
+            neighbor_names = list(neighbor_resources.keys())
+
+        # Build container names list for PID collection
+        container_names = []
+        if ptf_name:
+            container_names.append(ptf_name)
+        # For cEOS neighbors, prepend 'net_' to neighbor names
+        container_names.extend([f"net_{name}" for name in neighbor_names])
+
+        # Collect PIDs for all containers
+        container_pids = await self._collect_container_pids(container_names)
+
+        # Extract PTF and neighbor PIDs from result
+        ptf_pid = container_pids.get(ptf_name) if ptf_name else None
+        neighbor_pids = {name: container_pids.get(f"net_{name}") for name in neighbor_names}
+
+        # Collect all PTF interfaces
+        all_ptf_interfaces = self._collect_ptf_interfaces()
+
+        # Get PTF interface names
+        ptf_interface_names = self._get_ptf_interface_names(ptf_name, all_ptf_interfaces)
+
+        # Get DUT interface names
+        dut_interface_names = self._get_dut_interface_names()
+
+        # Get neighbor interface names
+        neighbor_interface_names = self._get_all_neighbor_interface_names()
+
+        # Build interface configuration arguments for all components
+        ptf_veth_args, ptf_attach_args = self._build_ptf_interface_args(
+            ptf_pid, ptf_interface_names, testbed_index
+        )
+        dut_attach_args = self._build_dut_interface_args(dut_interface_names, testbed_index)
+        neighbor_veth_args, neighbor_attach_args = self._build_neighbor_interface_args(
+            neighbor_pids, neighbor_interface_names, testbed_index
+        )
+
+        # Combine all arguments
+        veth_creation_args = ptf_veth_args + neighbor_veth_args
+        interface_attachment_args = ptf_attach_args + dut_attach_args + neighbor_attach_args
+
+        # Create veth pairs and attach to namespaces concurrently
+        await asyncio.gather(*[
+            self._create_veth_to_namespace(**veth_args)
+            for veth_args in veth_creation_args
+        ])
+
+        # Create OVS bridges with all ports
+        await self._create_ovs_bridges(interface_attachment_args, testbed_index)
+
+        # Build and apply OpenFlow rules for dataplane bridge
+        openflow_rules = self._build_dataplane_flows(ptf_interface_names, dut_interface_names, neighbor_interface_names)
+        await self._apply_dataplane_flows(openflow_rules, testbed_index)
+
+        # Assign IP addresses to bridges
+        await self._assign_bridge_ips()
+
+        # Assign IP addresses to PTF interfaces
+        await self._assign_ptf_interface_ips(ptf_pid, ptf_name)
 
         self.changed = True
         self.msg = 'Topology deployment completed'
@@ -564,13 +1139,81 @@ class TestbedTopology:
     async def undeploy(self):
         """Undeploy topology connections.
 
+        Removes OVS bridges and veth pairs. Uses the same interface name generation
+        functions as deploy() to identify which veth pairs to delete.
+
         Returns:
             dict: Result dictionary with changed status and message
         """
-        # TODO: Implement topology undeployment logic
+        # Get testbed index for bridge names
+        testbed_index = self.testbed_resources.get('index')
+
+        if testbed_index is None:
+            self.changed = False
+            self.msg = 'No testbed index found, nothing to undeploy'
+            return self._build_result()
+
+        # Collect all interface names using the same functions as deploy
+        veth_interfaces_to_delete = []
+
+        # PTF interfaces
+        ptf_resources = self.testbed_resources.get('ptf', {})
+        if ptf_resources:
+            ptf_name = list(ptf_resources.keys())[0]
+            all_ptf_interfaces = self._collect_ptf_interfaces()
+            ptf_interface_names = self._get_ptf_interface_names(ptf_name, all_ptf_interfaces)
+
+            if ptf_interface_names['management']:
+                veth_interfaces_to_delete.append(ptf_interface_names['management'])
+            veth_interfaces_to_delete.extend(ptf_interface_names['dataplane'])
+            if ptf_interface_names['backplane']:
+                veth_interfaces_to_delete.append(ptf_interface_names['backplane'])
+
+        # Neighbor interfaces
+        neighbor_interface_names = self._get_all_neighbor_interface_names()
+        for interface_names in neighbor_interface_names.values():
+            if interface_names['management']:
+                veth_interfaces_to_delete.append(interface_names['management'])
+            veth_interfaces_to_delete.extend(interface_names['dataplane'])
+            if interface_names['backplane']:
+                veth_interfaces_to_delete.append(interface_names['backplane'])
+
+        # Define bridge names
+        bridges = [
+            f"br{testbed_index}m",
+            f"br{testbed_index}b",
+            f"br{testbed_index}d"
+        ]
+
+        # Build deletion tasks
+        delete_tasks = []
+
+        # Add veth interface deletion tasks
+        for veth_interface in veth_interfaces_to_delete:
+            delete_tasks.append(
+                self._run(
+                    f"ip link delete {veth_interface}",
+                    check=False,
+                    ignore_errors=True
+                )
+            )
+
+        # Add bridge deletion tasks
+        for bridge_name in bridges:
+            delete_tasks.append(
+                self._run(
+                    f"ovs-vsctl --if-exists del-br {bridge_name}",
+                    check=False,
+                    ignore_errors=True
+                )
+            )
+
+
+        # Execute all deletions concurrently
+        await asyncio.gather(*delete_tasks)
 
         self.changed = True
-        self.msg = 'Topology undeployment not yet implemented'
+        self.msg = f'Topology undeployment completed for testbed index {testbed_index}'
 
         return self._build_result()
 

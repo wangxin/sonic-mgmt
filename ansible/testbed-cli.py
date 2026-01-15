@@ -10,7 +10,7 @@ from typing import Annotated
 
 import typer
 
-from testbed.deploy import deploy_testbed
+from testbed.deploy import deploy_testbed, undeploy_testbed
 
 
 __version__ = "1.0.0"
@@ -54,11 +54,9 @@ def setup_logging(verbosity: int):
     console_handler = logging.StreamHandler()
     console_handler.setLevel(cli_log_level)
 
-    # Use simpler format for INFO/WARNING, detailed for DEBUG
-    if cli_log_level <= logging.INFO:
-        formatter = logging.Formatter('%(levelname)s: %(message)s')
-    else:
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Use detailed format with filename and line number for better debugging
+    # formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
@@ -131,12 +129,16 @@ def deploy(
         str,
         typer.Option("--testbed-name", help="Name of the testbed to deploy")
     ],
+    server: Annotated[
+        str | None,
+        typer.Option("--server", help="Target server name (optional, will auto-select if not provided). Overrides server in testbed definition")
+    ] = None,
 ):
     """
     Deploy testbed.
     """
     try:
-        deploy_testbed(testbed_file, testbed_name)
+        deploy_testbed(testbed_file, testbed_name, server=server)
     except (ValueError, RuntimeError, FileNotFoundError) as e:
         # Expected errors - show clean message
         logger.error(f"{e}")
@@ -148,6 +150,51 @@ def deploy(
         # Unexpected errors - always show traceback
         logger.exception("Unexpected error occurred:")
         raise typer.Exit(code=1)
+
+
+@app.command()
+def configure(
+    testbed_file: Annotated[
+        str,
+        typer.Option("--testbed-file", help="Path to the testbed configuration file")
+    ],
+    testbed_name: Annotated[
+        str,
+        typer.Option("--testbed-name", help="Name of the testbed to configure")
+    ],
+):
+    """
+    Configure testbed.
+    """
+    # TODO: Implement testbed configuration
+    logger.info(f"Configuring testbed '{testbed_name}' from '{testbed_file}'")
+    typer.echo(f"Configure command not yet implemented for testbed: {testbed_name}")
+
+
+@app.command()
+def undeploy(
+    testbed_file: Annotated[
+        str,
+        typer.Option("--testbed-file", help="Path to the testbed configuration file")
+    ],
+    testbed_name: Annotated[
+        str,
+        typer.Option("--testbed-name", help="Name of the testbed to undeploy")
+    ],
+    server: Annotated[
+        str | None,
+        typer.Option("--server", help="Target server name (optional, will auto-detect if not provided)")
+    ] = None,
+):
+    """
+    Undeploy testbed.
+    """
+    logger.info(f"Undeploying testbed '{testbed_name}' from '{testbed_file}'")
+    undeploy_testbed(
+        testbed_file=testbed_file,
+        testbed_name=testbed_name,
+        server=server
+    )
 
 
 if __name__ == '__main__':

@@ -5,7 +5,17 @@ import yaml
 
 from pathlib import Path
 from natsort import natsorted
-from jinja2 import Template
+from jinja2 import Environment, FileSystemLoader
+from ansible.plugins.filter.core import FilterModule as CoreFilterModule
+try:
+    # Import all filter modules from ansible.utils collection
+    from ansible_collections.ansible.utils.plugins.filter.ipaddr import FilterModule as IpaddrFilterModule
+    from ansible_collections.ansible.utils.plugins.filter.ipv4 import FilterModule as Ipv4FilterModule
+    from ansible_collections.ansible.utils.plugins.filter.ipv6 import FilterModule as Ipv6FilterModule
+except ImportError:
+    IpaddrFilterModule = None
+    Ipv4FilterModule = None
+    Ipv6FilterModule = None
 
 from .base import AnsibleHosts
 from .base import AnsibleLocalhost
@@ -20,6 +30,9 @@ from .allocate import allocate_testbed_resources
 
 
 logger = logging.getLogger(__name__)
+
+# Network base container image for cEOS neighbors
+NET_IMAGE = "alpine:latest"
 
 
 def get_all_deployed_testbeds(servers) -> dict[str, dict]:
@@ -272,7 +285,7 @@ def deploy_sonic_vm(
 
     # Clean up any existing DUT VMs (destroy and undefine if they exist)
     with server_host:
-        for dut_name in duts.keys():
+        for dut_name in testbed.duts:
             logger.debug(f"Cleaning up VM '{dut_name}' if it exists")
 
             # Destroy VM if running (ignore errors if not running)
@@ -308,7 +321,7 @@ def deploy_sonic_vm(
             mode="0755",
         )
 
-    for dut_name in duts.keys():
+    for dut_name in testbed.duts:
         # Gather DUT-specific variables
         dut_hwsku = get_ansible_var(server_host.inventory, dut_name, 'hwsku')
         asic_type = get_ansible_var(server_host.inventory, dut_name, 'asic_type', default='')
@@ -343,7 +356,8 @@ def deploy_sonic_vm(
             "disk_image": dut_disk_image,
             "serial_port": testbed_resources['duts'][dut_name]['serial_port'],
             "port_alias": port_alias,
-            "fp_mtu_size": 9216
+            "fp_mtu_size": 9216,
+            "dedicated_mgmt_port": True
         }
         server_host.update_extra_vars(sonic_vm_vars)
         server_host.virt(
@@ -359,6 +373,12 @@ def deploy_sonic_vm(
             uri="qemu:///system",
             task_directives={"become": True}
         )
+
+        # Store front panel ports info
+        num_ports = len(port_alias)
+        fp_ports = [f"{dut_name}-{i}" for i in range(num_ports)]
+        testbed_resources['duts'][dut_name]['fp_ports'] = fp_ports
+        logger.debug(f"Stored {num_ports} front panel ports for '{dut_name}': {fp_ports}")
 
         # Calculate management gateway (first IP in subnet)
         dut_mgmt_ip = testbed_resources['duts'][dut_name]['ipv4']
@@ -448,7 +468,7 @@ def deploy_ptf(
     server_host.docker_container(
         name=ptf_name,
         image=full_ptf_image,
-        pull="always",
+        pull="missing",
         state="started",
         restart="no",
         network_mode="none",
@@ -502,12 +522,47 @@ def deploy_ptf(
     logger.info(f"PTF container '{ptf_name}' deployed and configured successfully")
 
 
+def _build_net_containers_compose_config(
+        neighbors: dict,
+        docker_registry: str
+    ) -> dict:
+    """
+    Build Docker Compose configuration for network base containers.
+
+    Args:
+        neighbors: Dictionary of neighbor configurations
+        docker_registry: Docker registry URL
+
+    Returns:
+        Docker Compose configuration dictionary
+    """
+    compose_config = {
+        'version': '3.8',
+        'services': {}
+    }
+
+    for neighbor_name in neighbors.keys():
+        net_container_name = f"net_{neighbor_name}"
+
+        compose_config['services'][net_container_name] = {
+            'image': f"{docker_registry}/{NET_IMAGE}",
+            'container_name': net_container_name,
+            'network_mode': 'none',
+            'privileged': True,
+            'cap_add': ['NET_ADMIN'],
+            'restart': 'no',
+            'command': 'sleep infinity',
+            'mem_limit': '16M'
+        }
+
+    return compose_config
+
+
 def deploy_ceos_network_containers(
         server_host: TestServer,
         testbed_resources: dict,
         testbed_name: str,
-        docker_registry: str,
-        net_image: str = "alpine:latest"
+        docker_registry: str
     ):
     """
     Deploy network base containers for cEOS neighbors using Docker Compose.
@@ -522,7 +577,6 @@ def deploy_ceos_network_containers(
         testbed_resources: Allocated resources for the testbed
         testbed_name: Name of the testbed
         docker_registry: Docker registry URL
-        net_image: Network container image name with tag (e.g., "alpine:latest")
     """
     neighbors = testbed_resources.get('neighbors', {})
     if not neighbors:
@@ -532,24 +586,7 @@ def deploy_ceos_network_containers(
     logger.info(f"Deploying network base containers for {len(neighbors)} neighbor(s) using Docker Compose")
 
     # Build docker-compose configuration
-    compose_config = {
-        'version': '3.8',
-        'services': {}
-    }
-
-    for neighbor_name in neighbors.keys():
-        net_container_name = f"net_{neighbor_name}"
-
-        compose_config['services'][net_container_name] = {
-            'image': f"{docker_registry}/{net_image}",
-            'container_name': net_container_name,
-            'network_mode': 'none',
-            'privileged': True,
-            'cap_add': ['NET_ADMIN'],
-            'restart': 'no',
-            'command': 'sleep infinity',
-            'mem_limit': '16M'
-        }
+    compose_config = _build_net_containers_compose_config(neighbors, docker_registry)
 
     # Convert to YAML and write to server
     compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
@@ -789,7 +826,7 @@ def generate_ceos_startup_configs(
         testbed_resources: dict,
         topology_definition: dict,
         neighbor_type: str = "ceos"
-):
+    ):
     """
     Generate startup configuration files for cEOS neighbors.
 
@@ -818,7 +855,7 @@ def generate_ceos_startup_configs(
     else:
         logger.warning("No swrole found in topology definition")
 
-# Determine template file name and path
+    # Determine template file name and path
     template_name = f"{base_topo}-{swrole}.j2"
     template_dir = Path(__file__).parent.parent / 'roles' / 'eos' / 'templates'
     template_path = template_dir / template_name
@@ -828,9 +865,30 @@ def generate_ceos_startup_configs(
 
     logger.debug(f"Using template: {template_path}")
 
-    # Load template content
-    template_content = template_path.read_text()
-    template = Template(template_content)
+    # Setup Jinja2 environment with Ansible filters
+    jinja_env = Environment(loader=FileSystemLoader(str(template_dir)))
+
+    # Add Ansible core filters
+    core_filters = CoreFilterModule()
+    jinja_env.filters.update(core_filters.filters())
+
+    # Add ansible.utils filters with namespaced names
+    utils_filter_modules = [
+        IpaddrFilterModule,
+        Ipv4FilterModule,
+        Ipv6FilterModule
+    ]
+
+    for filter_module_class in utils_filter_modules:
+        if filter_module_class:
+            filter_module = filter_module_class()
+            for filter_name, filter_func in filter_module.filters().items():
+                # Register with both the short name and the full namespaced name
+                jinja_env.filters[filter_name] = filter_func
+                jinja_env.filters[f'ansible.utils.{filter_name}'] = filter_func
+
+    # Load the template
+    template = jinja_env.get_template(template_name)
 
     # Build mapping between testbed_resources neighbor names and topology_definition neighbor hostnames
     # Both lists are natsorted to create 1-to-1 mapping
@@ -867,11 +925,34 @@ def generate_ceos_startup_configs(
             logger.warning(f"No hostname mapping found for neighbor '{neighbor_name}', skipping")
             continue
 
+        # Parse neighbor management IP (CIDR format)
+        neighbor_mgmt_ip = neighbors[neighbor_name]['ipv4']
+        mgmt_interface = ipaddress.ip_interface(neighbor_mgmt_ip)
+
+        # Calculate management gateway (first IP in subnet)
+        mgmt_network = ipaddress.ip_network(neighbor_mgmt_ip, strict=False)
+        vm_mgmt_gw = str(next(mgmt_network.hosts()))
+        host_config = topology_definition.get('configuration', {}).get(hostname, {})
+
+        # Calculate backplane interface name
+        host_interfaces = host_config.get('interfaces', {})
+        fp_interfaces = [intf for intf in host_interfaces.keys() if intf.startswith('Ethernet')]
+        max_interface_num = len(fp_interfaces)
+        bp_ifname = f"Ethernet{max_interface_num + 1}"
+
+        topo_properties = topology_definition.get('properties', {})
+
         # Prepare template variables (isolated dict, won't affect server_host)
         template_vars = {
             'hostname': hostname,
-            'ansible_host': neighbors[neighbor_name]['ipv4'],
-            'vm_type': neighbor_type
+            'ansible_host': str(mgmt_interface.ip),
+            'mgmt_prefixlen': mgmt_interface.network.prefixlen,
+            'vm_type': neighbor_type,
+            'vm_mgmt_gw': vm_mgmt_gw,
+            'bp_ifname': bp_ifname,
+            'snmp_rocommunity': 'public',
+            'configuration': topology_definition.get('configuration', {}),
+            'props': topo_properties.get('common', {})
         }
 
         # Render template locally using Jinja2
@@ -888,6 +969,60 @@ def generate_ceos_startup_configs(
         )
 
     logger.info(f"Successfully generated startup configs for {len(neighbors)} neighbor(s)")
+
+
+def _build_ceos_containers_compose_config(
+        neighbors: dict,
+        ceos_image: str,
+        memory: str = "2G",
+        memory_swap: str = "4G"
+    ) -> dict:
+    """
+    Build Docker Compose configuration for cEOS containers.
+
+    Args:
+        neighbors: Dictionary of neighbor configurations
+        ceos_image: cEOS Docker image name with tag
+        memory: Memory limit for container (default: "2G")
+        memory_swap: Memory swap limit for container (default: "4G")
+
+    Returns:
+        Docker Compose configuration dictionary
+    """
+    compose_config = {
+        'version': '3.8',
+        'services': {}
+    }
+
+    for neighbor_name in neighbors.keys():
+        ceos_container_name = f"ceos_{neighbor_name}"
+        net_container_name = f"net_{neighbor_name}"
+
+        compose_config['services'][ceos_container_name] = {
+            'image': ceos_image,
+            'container_name': ceos_container_name,
+            'network_mode': f"container:{net_container_name}",
+            'privileged': True,
+            'cap_add': ['NET_ADMIN'],
+            'restart': 'no',
+            'command': '/sbin/init systemd.setenv=INTFTYPE=eth systemd.setenv=ETBA=1 systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1 systemd.setenv=CEOS=1 systemd.setenv=EOS_PLATFORM=ceoslab systemd.setenv=container=docker systemd.setenv=MGMT_INTF=eth0',
+            'environment': {
+                'CEOS': '1',
+                'EOS_PLATFORM': 'ceoslab',
+                'container': 'docker',
+                'ETBA': '1',
+                'SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT': '1',
+                'INTFTYPE': 'eth',
+                'MGMT_INTF': 'eth0'
+            },
+            'volumes': [
+                f"{C.CEOS_IMAGE_MOUNT_DIR}/{neighbor_name}:/mnt/flash"
+            ],
+            'mem_limit': memory,
+            'memswap_limit': memory_swap
+        }
+
+    return compose_config
 
 
 def deploy_ceos_containers(
@@ -926,38 +1061,7 @@ def deploy_ceos_containers(
     logger.info(f"Deploying cEOS containers for {len(neighbors)} neighbor(s) using Docker Compose with image '{ceos_image}'")
 
     # Build docker-compose configuration
-    compose_config = {
-        'version': '3.8',
-        'services': {}
-    }
-
-    for neighbor_name in neighbors.keys():
-        ceos_container_name = f"ceos_{neighbor_name}"
-        net_container_name = f"net_{neighbor_name}"
-
-        compose_config['services'][ceos_container_name] = {
-            'image': ceos_image,
-            'container_name': ceos_container_name,
-            'network_mode': f"container:{net_container_name}",
-            'privileged': True,
-            'cap_add': ['NET_ADMIN'],
-            'restart': 'no',
-            'command': '/sbin/init systemd.setenv=INTFTYPE=eth systemd.setenv=ETBA=1 systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1 systemd.setenv=CEOS=1 systemd.setenv=EOS_PLATFORM=ceoslab systemd.setenv=container=docker systemd.setenv=MGMT_INTF=eth0',
-            'environment': {
-                'CEOS': '1',
-                'EOS_PLATFORM': 'ceoslab',
-                'container': 'docker',
-                'ETBA': '1',
-                'SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT': '1',
-                'INTFTYPE': 'eth',
-                'MGMT_INTF': 'eth0'
-            },
-            'volumes': [
-                f"{C.CEOS_IMAGE_MOUNT_DIR}/{neighbor_name}:/mnt/flash"
-            ],
-            'mem_limit': memory,
-            'memswap_limit': memory_swap
-        }
+    compose_config = _build_ceos_containers_compose_config(neighbors, ceos_image, memory, memory_swap)
 
     # Convert to YAML and write to server
     compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
@@ -1054,10 +1158,10 @@ def deploy_testbed(
 
     # Check if the testbed is already deployed on any server in the group
     servers = AnsibleHosts(group_inventory_file, 'server')
-    deploy_testbeds = get_all_deployed_testbeds(servers)
+    deployed_testbeds = get_all_deployed_testbeds(servers)
 
     # Check deployment status and get server if testbed is currently being deployed
-    currently_deploying_on_server = check_testbed_deployment_status(testbed.name, deploy_testbeds)
+    currently_deploying_on_server = check_testbed_deployment_status(testbed.name, deployed_testbeds)
 
     if currently_deploying_on_server is None:
         logger.info(f"Testbed '{testbed.name}' is not currently deployed on any server, continuing deployment")
@@ -1176,3 +1280,271 @@ def deploy_testbed(
             testbed_resources=testbed_resources,
             testbed_name=testbed.name
         )
+
+    # Update testbed info to server after deployment
+    logger.info(f"Updating testbed info to server '{selected_server}'")
+    testbed_info = {
+        **testbed_resources,
+        'status': 'deployed'
+    }
+    server_host.server_testbeds(
+        operation='update',
+        testbeds_json_file=C.SERVER_TESTBEDS_FILE,
+        testbed_info=testbed_info,
+        task_directives={'become': True}
+    )
+
+
+def _find_deployed_server(testbed_name: str, group_inventory_file: str, server: str | None = None):
+    """
+    Find which server has the testbed deployed.
+
+    Args:
+        testbed_name: Name of the testbed to find
+        group_inventory_file: Path to group inventory file
+        server: Optional server name to verify against
+
+    Returns:
+        tuple: (server_name, deployed_testbed_info)
+
+    Raises:
+        ValueError: If testbed not found or server mismatch
+    """
+    logger.info("Checking if testbed is deployed on any server in the group")
+    servers = AnsibleHosts(group_inventory_file, 'server')
+    deployed_testbeds = get_all_deployed_testbeds(servers)
+
+    # Find which server has this testbed
+    found_server = None
+    deployed_testbed_info = None
+    for server_name, deployed_testbeds_info in deployed_testbeds.items():
+        for deployed_testbed in deployed_testbeds_info.get('testbeds', []):
+            if deployed_testbed.get('name') == testbed_name:
+                found_server = server_name
+                deployed_testbed_info = deployed_testbed
+                logger.info(f"Found testbed '{testbed_name}' deployed on server '{server_name}'")
+                break
+        if found_server:
+            break
+
+    if found_server is None:
+        raise ValueError(f"Testbed '{testbed_name}' is not deployed on any server")
+
+    # If server is provided, verify it matches the found server
+    if server is not None:
+        if server != found_server:
+            raise ValueError(
+                f"Testbed '{testbed_name}' is deployed on server '{found_server}', "
+                f"but you specified server '{server}'"
+            )
+        logger.debug(f"Verified testbed is on specified server '{server}'")
+    else:
+        logger.info(f"Auto-detected server '{found_server}' for undeployment")
+
+    return found_server, deployed_testbed_info
+
+
+def _undeploy_ceos_containers(
+        server_host: TestServer,
+        testbed_name: str,
+        neighbors: dict
+    ):
+    """
+    Remove cEOS and net containers using Docker Compose.
+
+    Args:
+        server_host: TestServer object for the target server
+        testbed_name: Name of the testbed
+        neighbors: Dictionary of neighbor configurations (names as keys)
+    """
+    if not neighbors:
+        logger.debug("No neighbors to remove, skipping container removal")
+        return
+
+    logger.info(f"Removing cEOS and net containers for {len(neighbors)} neighbor(s)")
+
+    # Remove cEOS containers - check if compose file exists, regenerate if needed
+    ceos_compose_file_path = f"/tmp/docker-compose-ceos-{testbed_name}.yml"
+    file_stat = server_host.stat(path=ceos_compose_file_path)
+
+    if not file_stat.get('stat', {}).get('exists', False):
+        logger.debug(f"cEOS compose file not found at {ceos_compose_file_path}, regenerating")
+        ceos_image = server_host.get_visible_var('ceos_image')
+        if ceos_image:
+            compose_config = _build_ceos_containers_compose_config(neighbors, ceos_image)
+            compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
+            server_host.copy(
+                content=compose_yaml,
+                dest=ceos_compose_file_path,
+                mode='0644',
+                task_directives={"become": True}
+            )
+        else:
+            logger.warning("ceos_image variable not found, skipping cEOS container removal")
+            ceos_compose_file_path = None
+
+    if ceos_compose_file_path:
+        logger.debug(f"Removing {len(neighbors)} cEOS container(s) using compose file: {ceos_compose_file_path}")
+        server_host.shell(
+            f"docker compose -f {ceos_compose_file_path} down",
+            task_directives={"become": True, "ignore_errors": True}
+        )
+        logger.info(f"Removed {len(neighbors)} cEOS container(s)")
+
+    # Remove net containers - check if compose file exists, regenerate if needed
+    net_compose_file_path = f"/tmp/docker-compose-net-{testbed_name}.yml"
+    file_stat = server_host.stat(path=net_compose_file_path)
+
+    if not file_stat.get('stat', {}).get('exists', False):
+        logger.debug(f"Net compose file not found at {net_compose_file_path}, regenerating")
+        docker_registry = server_host.get_visible_var('docker_registry_host')
+        if docker_registry:
+            compose_config = _build_net_containers_compose_config(neighbors, docker_registry)
+            compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
+            server_host.copy(
+                content=compose_yaml,
+                dest=net_compose_file_path,
+                mode='0644',
+                task_directives={"become": True}
+            )
+        else:
+            logger.warning("docker_registry_host variable not found, skipping net container removal")
+            net_compose_file_path = None
+
+    if net_compose_file_path:
+        logger.debug(f"Removing {len(neighbors)} net container(s) using compose file: {net_compose_file_path}")
+        server_host.shell(
+            f"docker compose -f {net_compose_file_path} down",
+            task_directives={"become": True, "ignore_errors": True}
+        )
+        logger.info(f"Removed {len(neighbors)} net container(s)")
+
+
+def _undeploy_kvm_vms(server_host: TestServer, duts_info: dict):
+    """
+    Remove KVM virtual machines.
+
+    Args:
+        server_host: TestServer object for the target server
+        duts_info: Dictionary of DUT VM information
+    """
+    if not duts_info:
+        logger.debug("No DUTs found in deployed testbed info")
+        return
+
+    logger.info(f"Removing {len(duts_info)} KVM VM(s)")
+    with server_host:
+        for dut_name in duts_info.keys():
+            logger.debug(f"Destroying and undefining VM '{dut_name}'")
+            # Destroy VM if running
+            server_host.shell(
+                f"virsh destroy '{dut_name}'",
+                task_directives={"become": True, "ignore_errors": True}
+            )
+            # Undefine VM
+            server_host.shell(
+                f"virsh undefine '{dut_name}'",
+                task_directives={"become": True, "ignore_errors": True}
+            )
+    logger.info(f"Removed {len(duts_info)} KVM VM(s)")
+
+
+def undeploy_testbed(
+        testbed_file: str,
+        testbed_name: str,
+        neighbor_type: str = "ceos",
+        server: str | None = None,
+    ):
+    """
+    Undeploy a testbed from a server.
+
+    Args:
+        testbed_file: Path to testbed configuration file
+        testbed_name: Name of the testbed to undeploy
+        neighbor_type: Type of neighbor devices (default: "ceos")
+        server: Target server name (optional, will auto-detect if not provided)
+    """
+    logger.info(f"Starting undeployment of testbed '{testbed_name}' from '{testbed_file}'")
+
+    # Initialize the testbed object
+    testbed: Testbed = get_testbed(testbed_file, testbed_name)
+    if testbed is None:
+        raise ValueError(f"Testbed '{testbed_name}' not found in file '{testbed_file}'")
+
+    logger.debug(f"Loaded testbed configuration: group={testbed.group}, type={testbed.topology}")
+
+    # Prepare the group inventory file
+    logger.debug(f"Generating group inventory file for group '{testbed.group}'")
+    group_inventory_file = generate_group_inventory_file(testbed.group, refresh=True)
+
+    # Find which server has the testbed deployed
+    server, deployed_testbed_info = _find_deployed_server(testbed_name, group_inventory_file, server)
+
+    # Extract testbed index (always available even for partial deployments)
+    testbed_index = deployed_testbed_info.get('index')
+    if testbed_index is None:
+        raise ValueError(f"Testbed '{testbed_name}' found on server '{server}' but has no index allocated")
+
+    logger.info(f"Undeploying testbed '{testbed_name}' from server '{server}' (index: {testbed_index})")
+
+    # Get topology definition and allocate resources to get container names
+    topology_definition = get_topology_definition(testbed.topology)
+    testbed_resources = allocate_testbed_resources(testbed, testbed_index, topology_definition)
+
+    # Create server_host object for the target server
+    server_host = TestServer(group_inventory_file, server)
+
+    # Build list of all containers to delete
+    containers_to_delete = []
+
+    # Add PTF container
+    ptf_name = list(testbed_resources['ptf'].keys())[0]
+    containers_to_delete.append(ptf_name)
+
+    # Add neighbor containers (ceos_ and net_ for each neighbor)
+    if neighbor_type == "ceos":
+        for neighbor_name in testbed_resources['neighbors'].keys():
+            containers_to_delete.append(f"ceos_{neighbor_name}")
+            containers_to_delete.append(f"net_{neighbor_name}")
+
+    # Delete all containers in parallel using xargs
+    if containers_to_delete:
+        logger.info(f"Removing {len(containers_to_delete)} container(s) in parallel")
+        containers_list = " ".join(containers_to_delete)
+        server_host.shell(
+            f"echo '{containers_list}' | xargs -n 1 -P 5 docker rm -f",
+            task_directives={"become": True, "ignore_errors": True}
+        )
+        logger.info(f"Removed {len(containers_to_delete)} container(s)")
+
+    # Remove KVM VMs if testbed type is kvm
+    if testbed.type == "kvm":
+        duts_info = testbed_resources.get('duts', {})
+        _undeploy_kvm_vms(server_host, duts_info)
+
+    # Remove OVS bridges and topology connections
+    logger.info("Removing OVS bridges and topology connections")
+    result = server_host.testbed_topology(
+        operation='undeploy',
+        topology_definition=topology_definition,
+        testbed_resources=testbed_resources,
+        neighbor_type=neighbor_type,
+        task_directives={'become': True, 'ignore_errors': True}
+    )
+
+    if result.get('failed', False) and not result.get('ignored', False):
+        logger.warning(f"Failed to remove some topology components: {result.get('msg', 'Unknown error')}")
+    else:
+        logger.info("Successfully removed OVS bridges and topology connections")
+
+    # Remove testbed info from server
+    logger.info(f"Removing testbed '{testbed_name}' info from server '{server}'")
+    server_host.server_testbeds(
+        operation='delete',
+        testbeds_json_file=C.SERVER_TESTBEDS_FILE,
+        testbed_name=testbed_name,
+        task_directives={'become': True}
+    )
+
+    logger.info(f"Successfully undeployed testbed '{testbed_name}' from server '{server}'")
+

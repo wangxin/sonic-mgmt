@@ -76,11 +76,13 @@ class TestServer(AnsibleHost):
             "libvirt-python",
             "docker",
             "lxml",
+            "natsort",
         ],
         "24.04": [
             "libvirt-python",
             "docker",
             "lxml",
+            "natsort",
         ],
     }
 

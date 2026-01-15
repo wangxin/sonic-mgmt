@@ -45,6 +45,33 @@ def _calculate_testbed_network(
     return testbed_network
 
 
+def generate_ptf_name(testbed_index: int) -> str:
+    """
+    Generate PTF name for a testbed.
+
+    Args:
+        testbed_index: Testbed index on the server
+
+    Returns:
+        str: PTF name (e.g., 'PTF00', 'PTF01')
+    """
+    return f"PTF{testbed_index:02d}"
+
+
+def generate_neighbor_names(testbed_index: int, vm_count: int) -> list[str]:
+    """
+    Generate list of neighbor VM names for a testbed.
+
+    Args:
+        testbed_index: Testbed index on the server
+        vm_count: Number of neighbor VMs
+
+    Returns:
+        list[str]: List of neighbor VM names (e.g., ['VM0000', 'VM0001', ...])
+    """
+    return [f"VM{testbed_index:02d}{vm_index:03d}" for vm_index in range(vm_count)]
+
+
 def allocate_testbed_resources(
         testbed_obj: Testbed,
         testbed_index: int,
@@ -124,7 +151,7 @@ def allocate_testbed_resources(
         testbed_network_v6, PTF_MANAGEMENT_IP_OFFSET_V6
     )[0]
     # Construct PTF name
-    ptf_name = f"PTF{testbed_index:02d}"
+    ptf_name = generate_ptf_name(testbed_index)
     ptf = {ptf_name: {'ipv4': ptf_ip_v4, 'ipv6': ptf_ip_v6}}
 
     # Allocate neighbor VM management IPs (always for all testbed types) - both IPv4 and IPv6
@@ -136,9 +163,10 @@ def allocate_testbed_resources(
         testbed_network_v6, NEIGHBOR_MANAGEMENT_IP_OFFSET_V6, count=vm_count
     )
     # Construct neighbor VM names with both IPv4 and IPv6
+    neighbor_names = generate_neighbor_names(testbed_index, vm_count)
     neighbors = {
-        f"VM{testbed_index:02d}{vm_index:03d}": {'ipv4': ipv4, 'ipv6': ipv6}
-        for vm_index, (ipv4, ipv6) in enumerate(zip(neighbor_ips_list_v4, neighbor_ips_list_v6))
+        name: {'ipv4': ipv4, 'ipv6': ipv6}
+        for name, ipv4, ipv6 in zip(neighbor_names, neighbor_ips_list_v4, neighbor_ips_list_v6)
     }
 
     # Build result - only include 'duts' for KVM testbeds

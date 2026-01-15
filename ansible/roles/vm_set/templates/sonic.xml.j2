@@ -82,7 +82,11 @@
       <protocol type='telnet'/>
     </serial>
     <interface type='ethernet'>
+    {% if dedicated_mgmt_port is defined and dedicated_mgmt_port %}
+        <target dev='{{ dut_name }}-m' />
+    {% else %}
         <target dev='{{ dut_name }}-0' />
+    {% endif %}
     {% if asic_type == 'vpp' %}
         <model type='virtio-net-pci' />
     {% else %}
@@ -91,7 +95,11 @@
     </interface>
 {% for i in range(port_alias|length) %}
     <interface type='ethernet' >
+    {% if dedicated_mgmt_port is defined and dedicated_mgmt_port %}
         <target dev='{{ dut_name }}-{{ i + 1 }}' />
+    {% else %}
+        <target dev='{{ dut_name }}-{{ i }}' />
+    {% endif %}
     {% if asic_type == 'vpp' %}
         <model type='virtio-net-pci' />
     {% else %}
