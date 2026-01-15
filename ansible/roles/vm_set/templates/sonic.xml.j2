@@ -96,9 +96,9 @@
 {% for i in range(port_alias|length) %}
     <interface type='ethernet' >
     {% if dedicated_mgmt_port is defined and dedicated_mgmt_port %}
-        <target dev='{{ dut_name }}-{{ i + 1 }}' />
-    {% else %}
         <target dev='{{ dut_name }}-{{ i }}' />
+    {% else %}
+        <target dev='{{ dut_name }}-{{ i + 1 }}' />
     {% endif %}
     {% if asic_type == 'vpp' %}
         <model type='virtio-net-pci' />
