@@ -1,0 +1,10 @@
+---
+
+- name: vms-kvm-t0
+  topology: t0
+  type: kvm
+  duts:
+    - vlab-01
+  group: vlab
+  server: server_1
+  ptf_image: docker-ptf

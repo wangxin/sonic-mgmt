@@ -2,7 +2,7 @@ import logging
 import ipaddress
 
 from .testbed import Testbed
-from .config import CONSTANTS as C
+from .settings import CONSTANTS as C
 
 
 logger = logging.getLogger(__name__)

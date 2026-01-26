@@ -9,8 +9,9 @@ from ansible.inventory.manager import InventoryManager
 from ansible.vars.manager import VariableManager
 from ansible.vars.hostvars import HostVars
 
-from .config import CONSTANTS as C
+from .settings import CONSTANTS as C
 from .testbed import Testbed
+from .base.ansible_hosts import _to_native_type
 
 
 # Cache for inventory managers to avoid re-parsing inventory files
@@ -98,7 +99,9 @@ def get_ansible_var(
     # Get all variables for the host
     host_vars = variable_manager._hostvars[hostname]
 
-    return host_vars.get(var_name, default)
+    # Get the variable value and unwrap any AnsibleUnsafeText objects
+    value = host_vars.get(var_name, default)
+    return _to_native_type(value)
 
 
 def read_devices_csv(group_name: str) -> list[dict]:
@@ -358,6 +361,12 @@ def generate_testbed_inventory_file(
                 'ansible_host': ipv4_addr,
                 'ansible_hostv6': ipv6_addr
             }
+
+            # Get HwSku from group_devices
+            for device in group_devices:
+                if device['Hostname'] == dut_name:
+                    dut_entry['hwsku'] = device['HwSku']
+                    break
 
             # Add host-specific variables if defined
             if dut_name in host_vars and host_vars[dut_name]:

@@ -11,6 +11,7 @@ from typing import Annotated
 import typer
 
 from testbed.deploy import deploy_testbed, undeploy_testbed
+from testbed.configure import configure_duts
 
 
 __version__ = "1.0.0"
@@ -129,6 +130,10 @@ def deploy(
         str,
         typer.Option("--testbed-name", help="Name of the testbed to deploy")
     ],
+    neighbor_type: Annotated[
+        str,
+        typer.Option("--neighbor-type", help="Type of neighbor devices (e.g., 'ceos')")
+    ] = "ceos",
     server: Annotated[
         str | None,
         typer.Option("--server", help="Target server name (optional, will auto-select if not provided). Overrides server in testbed definition")
@@ -138,7 +143,7 @@ def deploy(
     Deploy testbed.
     """
     try:
-        deploy_testbed(testbed_file, testbed_name, server=server)
+        deploy_testbed(testbed_file, testbed_name, neighbor_type=neighbor_type, server=server)
     except (ValueError, RuntimeError, FileNotFoundError) as e:
         # Expected errors - show clean message
         logger.error(f"{e}")
@@ -166,9 +171,11 @@ def configure(
     """
     Configure testbed.
     """
-    # TODO: Implement testbed configuration
     logger.info(f"Configuring testbed '{testbed_name}' from '{testbed_file}'")
-    typer.echo(f"Configure command not yet implemented for testbed: {testbed_name}")
+    configure_duts(
+        testbed_file=testbed_file,
+        testbed_name=testbed_name
+    )
 
 
 @app.command()
@@ -181,6 +188,10 @@ def undeploy(
         str,
         typer.Option("--testbed-name", help="Name of the testbed to undeploy")
     ],
+    neighbor_type: Annotated[
+        str,
+        typer.Option("--neighbor-type", help="Type of neighbor devices (e.g., 'ceos')")
+    ] = "ceos",
     server: Annotated[
         str | None,
         typer.Option("--server", help="Target server name (optional, will auto-detect if not provided)")
@@ -193,6 +204,7 @@ def undeploy(
     undeploy_testbed(
         testbed_file=testbed_file,
         testbed_name=testbed_name,
+        neighbor_type=neighbor_type,
         server=server
     )
 

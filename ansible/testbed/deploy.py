@@ -20,7 +20,7 @@ except ImportError:
 from .base import AnsibleHosts
 from .base import AnsibleLocalhost
 from .base import TestServer
-from .config import CONSTANTS as C
+from .settings import CONSTANTS as C
 from .testbed import Testbed, get_testbed
 from .inventory import generate_group_inventory_file
 from .inventory import generate_testbed_inventory_file
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 NET_IMAGE = "alpine:latest"
 
 
-def get_all_deployed_testbeds(servers) -> dict[str, dict]:
+def _get_all_deployed_testbeds(servers) -> dict[str, dict]:
     """
     Get all deployed testbeds on the given servers.
 
@@ -73,7 +73,7 @@ def get_all_deployed_testbeds(servers) -> dict[str, dict]:
     return deployed_testbeds
 
 
-def pick_server_for_deployment(
+def _pick_server_for_deployment(
         servers: AnsibleHosts,
     ) -> str | None:
     """
@@ -161,7 +161,7 @@ def pick_server_for_deployment(
     return None
 
 
-def check_testbed_deployment_status(
+def _check_testbed_deployment_status(
         testbed_name: str,
         deployed_testbeds: dict[str, dict]
     ) -> str | None:
@@ -202,7 +202,7 @@ def check_testbed_deployment_status(
     return currently_deploying_on_server
 
 
-def resolve_deployment_server(
+def _resolve_deployment_server(
         testbed_name: str,
         server_from_cli: str | None,
         server_from_testbed: str | None,
@@ -251,10 +251,11 @@ def resolve_deployment_server(
         return server
 
 
-def deploy_sonic_vm(
+def _deploy_sonic_vm(
         testbed: Testbed,
         testbed_resources: dict,
         server_host: TestServer,
+        dut_hosts: AnsibleHosts,
         localhost: AnsibleLocalhost
     ) -> dict[str, str]:
     """
@@ -285,24 +286,24 @@ def deploy_sonic_vm(
 
     # Clean up any existing DUT VMs (destroy and undefine if they exist)
     with server_host:
-        for dut_name in testbed.duts:
-            logger.debug(f"Cleaning up VM '{dut_name}' if it exists")
+        for dut_host in testbed.duts:
+            logger.debug(f"Cleaning up VM '{dut_host}' if it exists")
 
             # Destroy VM if running (ignore errors if not running)
             server_host.shell(
-                f"virsh destroy '{dut_name}'",
+                f"virsh destroy '{dut_host}'",
                 module_ignore_errors=True,
                 task_directives={"become": True}
             )
 
             # Undefine VM if defined (ignore errors if not defined)
             server_host.shell(
-                f"virsh undefine '{dut_name}'",
+                f"virsh undefine '{dut_host}'",
                 module_ignore_errors=True,
                 task_directives={"become": True}
             )
 
-    logger.debug(f"VM '{dut_name}' cleanup completed, ready for deployment")
+    logger.debug(f"VM '{dut_host}' cleanup completed, ready for deployment")
 
     server_home_folder = Path(server_host.shell("echo $HOME")['stdout'].strip())
     disk_folder = server_home_folder / 'sonic-vm' / 'disks'
@@ -321,16 +322,14 @@ def deploy_sonic_vm(
             mode="0755",
         )
 
-    for dut_name in testbed.duts:
-        # Gather DUT-specific variables
-        dut_hwsku = get_ansible_var(server_host.inventory, dut_name, 'hwsku')
-        asic_type = get_ansible_var(server_host.inventory, dut_name, 'asic_type', default='')
-        dut_num_asics = get_ansible_var(server_host.inventory, dut_name, 'num_asics', default=1)
-        dut_disk_image = Path(server_home_folder) / 'sonic-vm' / 'disks'/ f'sonic_{dut_name}.img'
-        # dut_disk_image = Path('/var/lib/libvirt/images') / f'sonic_{dut_name}.img'
-        port_alias = localhost.port_alias(hwsku=dut_hwsku, num_asic=dut_num_asics)["ansible_facts"]["port_alias"]
+    for dut_host in dut_hosts:
 
-        if asic_type == 'vpp':
+        dut_hwsku = dut_host.visible_vars.get('hwsku', '')
+        dut_asic_type = dut_host.visible_vars.get('asic_type', '')
+        dut_num_asics = dut_host.visible_vars.get('num_asics', 1)
+
+        dut_disk_image = Path(server_home_folder) / 'sonic-vm' / 'disks'/ f'sonic_{dut_host}.img'
+        if dut_asic_type == 'vpp':
             src_disk_image = Path(image_folder) / 'sonic-vpp.img'
         else:
             src_disk_image = Path(image_folder) / 'sonic-vs.img'
@@ -347,28 +346,33 @@ def deploy_sonic_vm(
         else:
             logger.debug(f"DUT disk image '{dut_disk_image}' already exists, skipping copy")
 
+        port_alias = localhost.port_alias(
+            hwsku=dut_hwsku,
+            num_asic=dut_num_asics
+        ).get('ansible_facts', {}).get('port_alias', [])
+
         # Start sonic kvm vm
-        logger.info(f"Defining and starting SONiC VM '{dut_name}' on server '{server_host.hostname}'")
+        logger.info(f"Defining and starting SONiC VM '{dut_host}' on server '{server_host.hostname}'")
         sonic_vm_vars = {
-            "dut_name": dut_name,
+            "dut_name": dut_host,
             "hwsku": dut_hwsku,
-            "asic_type": asic_type,
+            "asic_type": dut_asic_type,
             "disk_image": dut_disk_image,
-            "serial_port": testbed_resources['duts'][dut_name]['serial_port'],
+            "serial_port": testbed_resources['duts'][dut_host]['serial_port'],
             "port_alias": port_alias,
             "fp_mtu_size": 9216,
             "dedicated_mgmt_port": True
         }
         server_host.update_extra_vars(sonic_vm_vars)
         server_host.virt(
-            name=dut_name,
+            name=dut_host,
             xml="{{ lookup('template', '../roles/vm_set/templates/sonic.xml.j2') }}",
             command="define",
             uri="qemu:///system",
             task_directives={"become": True}
         )
         server_host.virt(
-            name=dut_name,
+            name=dut_host,
             state="running",
             uri="qemu:///system",
             task_directives={"become": True}
@@ -376,22 +380,22 @@ def deploy_sonic_vm(
 
         # Store front panel ports info
         num_ports = len(port_alias)
-        fp_ports = [f"{dut_name}-{i}" for i in range(num_ports)]
-        testbed_resources['duts'][dut_name]['fp_ports'] = fp_ports
-        logger.debug(f"Stored {num_ports} front panel ports for '{dut_name}': {fp_ports}")
+        fp_ports = [f"{dut_host}-{i}" for i in range(num_ports)]
+        testbed_resources['duts'][dut_host]['fp_ports'] = fp_ports
+        logger.debug(f"Stored {num_ports} front panel ports for '{dut_host}': {fp_ports}")
 
         # Calculate management gateway (first IP in subnet)
-        dut_mgmt_ip = testbed_resources['duts'][dut_name]['ipv4']
+        dut_mgmt_ip = testbed_resources['duts'][dut_host]['ipv4']
         mgmt_network = ipaddress.ip_network(dut_mgmt_ip, strict=False)
         mgmt_gw = str(next(mgmt_network.hosts()))
 
         # Start sonic_kickstart in async mode to configure SONiC VM in background
-        logger.info(f"Starting async sonic_kickstart for '{dut_name}'")
+        logger.info(f"Starting async sonic_kickstart for '{dut_host}'")
         kickstart_result = server_host.sonic_kickstart(
-            telnet_port=testbed_resources['duts'][dut_name]['serial_port'],
+            telnet_port=testbed_resources['duts'][dut_host]['serial_port'],
             login="{{ sonic_login }}",
             passwords="{{ sonic_default_passwords }}",
-            hostname=dut_name,
+            hostname=dut_host,
             mgmt_ip=dut_mgmt_ip,
             mgmt_gw=mgmt_gw,
             new_password="{{ sonic_password }}",
@@ -402,16 +406,16 @@ def deploy_sonic_vm(
         # Store the async job ID for later status checking
         jid = kickstart_result.get('ansible_job_id')
         if jid:
-            kickstart_jids[dut_name] = jid
-            logger.debug(f"sonic_kickstart for '{dut_name}' started with job ID: {jid}")
+            kickstart_jids[dut_host] = jid
+            logger.debug(f"sonic_kickstart for '{dut_host}' started with job ID: {jid}")
         else:
-            logger.warning(f"No job ID returned for sonic_kickstart on '{dut_name}'")
+            logger.warning(f"No job ID returned for sonic_kickstart on '{dut_host}'")
 
     logger.info(f"All {len(duts)} SONiC VM(s) deployed and kickstart running in background")
     return kickstart_jids
 
 
-def deploy_ptf(
+def _deploy_ptf(
         server_host: TestServer,
         testbed_resources: dict,
         ptf_image: str = "docker-ptf:latest",
@@ -558,7 +562,7 @@ def _build_net_containers_compose_config(
     return compose_config
 
 
-def deploy_ceos_network_containers(
+def _deploy_ceos_network_containers(
         server_host: TestServer,
         testbed_resources: dict,
         testbed_name: str,
@@ -675,7 +679,7 @@ def _build_ceos_image_from_orig(
     logger.info(f"Successfully built Docker image '{ceos_image}' from '{ceos_image_orig}'")
 
 
-def prepare_ceos_image(server_host: TestServer):
+def _prepare_ceos_image(server_host: TestServer):
     """
     Prepare cEOS image on the server.
 
@@ -820,7 +824,7 @@ def prepare_ceos_image(server_host: TestServer):
     _build_ceos_image_from_orig(server_host, ceos_image_orig, ceos_image)
 
 
-def generate_ceos_startup_configs(
+def _generate_ceos_startup_configs(
         server_host: TestServer,
         testbed: Testbed,
         testbed_resources: dict,
@@ -888,7 +892,7 @@ def generate_ceos_startup_configs(
                 jinja_env.filters[f'ansible.utils.{filter_name}'] = filter_func
 
     # Load the template
-    template = jinja_env.get_template(template_name)
+    startup_config_template = jinja_env.get_template(template_name)
 
     # Build mapping between testbed_resources neighbor names and topology_definition neighbor hostnames
     # Both lists are natsorted to create 1-to-1 mapping
@@ -957,7 +961,7 @@ def generate_ceos_startup_configs(
 
         # Render template locally using Jinja2
         logger.debug(f"Rendering startup config for '{neighbor_name}' (hostname: {hostname})")
-        config_content = template.render(**template_vars)
+        config_content = startup_config_template.render(**template_vars)
 
         # Write rendered config to server
         logger.debug(f"Writing startup config to {config_file_path}")
@@ -1025,7 +1029,7 @@ def _build_ceos_containers_compose_config(
     return compose_config
 
 
-def deploy_ceos_containers(
+def _deploy_ceos_containers(
         server_host: TestServer,
         testbed_resources: dict,
         testbed_name: str,
@@ -1092,7 +1096,7 @@ def deploy_ceos_containers(
     logger.info(f"All {len(neighbors)} cEOS container(s) deployed successfully using Docker Compose")
 
 
-def bind_topology_ceos(
+def _bind_topology_ceos(
         server_host: TestServer,
         testbed_resources: dict,
         topology_definition: dict,
@@ -1158,10 +1162,10 @@ def deploy_testbed(
 
     # Check if the testbed is already deployed on any server in the group
     servers = AnsibleHosts(group_inventory_file, 'server')
-    deployed_testbeds = get_all_deployed_testbeds(servers)
+    deployed_testbeds = _get_all_deployed_testbeds(servers)
 
     # Check deployment status and get server if testbed is currently being deployed
-    currently_deploying_on_server = check_testbed_deployment_status(testbed.name, deployed_testbeds)
+    currently_deploying_on_server = _check_testbed_deployment_status(testbed.name, deployed_testbeds)
 
     if currently_deploying_on_server is None:
         logger.info(f"Testbed '{testbed.name}' is not currently deployed on any server, continuing deployment")
@@ -1169,7 +1173,7 @@ def deploy_testbed(
         logger.info(f"Testbed '{testbed.name}' has incomplete deployment on server '{currently_deploying_on_server}'")
 
     # Resolve which server to use for deployment
-    resolved_server = resolve_deployment_server(
+    resolved_server = _resolve_deployment_server(
         testbed.name,
         server,
         testbed.server,
@@ -1179,7 +1183,7 @@ def deploy_testbed(
     if resolved_server is None:
         # Server is not specified anywhere. No previous unfinished deployment. Pick a server automatically.
         logger.info("No server specified. No previous unfinished deployment. Pick a server automatically.")
-        selected_server = pick_server_for_deployment(servers)
+        selected_server = _pick_server_for_deployment(servers)
 
         if selected_server is None:
             raise RuntimeError("Failed to select a suitable server for deployment")
@@ -1229,13 +1233,14 @@ def deploy_testbed(
 
     # Replace server_host with new inventory including testbed DUTs and PTF
     server_host = TestServer(testbed_inventory_file, selected_server)
+    dut_hosts = AnsibleHosts(testbed_inventory_file, 'dut')
 
     # If KVM testbed, bring up the SONiC VM
     if testbed.type == "kvm":
-        deploy_sonic_vm(testbed, testbed_resources, server_host, localhost)
+        _deploy_sonic_vm(testbed, testbed_resources, server_host, dut_hosts, localhost)
 
     # Deploy PTF container
-    deploy_ptf(
+    _deploy_ptf(
         server_host,
         testbed_resources,
         ptf_image=testbed.ptf_image
@@ -1247,7 +1252,7 @@ def deploy_testbed(
 
     # if neighbor type is "ceos", deploy base net containers for neighbors firstly
     if neighbor_type == "ceos":
-        deploy_ceos_network_containers(
+        _deploy_ceos_network_containers(
             server_host=server_host,
             testbed_resources=testbed_resources,
             testbed_name=testbed.name,
@@ -1256,7 +1261,7 @@ def deploy_testbed(
 
     # Bind topology connections between DUTs, PTF, and neighbors
     if neighbor_type == "ceos":
-        bind_topology_ceos(
+        _bind_topology_ceos(
             server_host=server_host,
             testbed_resources=testbed_resources,
             topology_definition=topology_definition,
@@ -1264,7 +1269,7 @@ def deploy_testbed(
         )
 
     if neighbor_type == "ceos":
-        generate_ceos_startup_configs(
+        _generate_ceos_startup_configs(
             server_host=server_host,
             testbed=testbed,
             testbed_resources=testbed_resources,
@@ -1274,8 +1279,8 @@ def deploy_testbed(
 
     if neighbor_type == "ceos":
         # Prepare the ceos image on the server
-        prepare_ceos_image(server_host=server_host)
-        deploy_ceos_containers(
+        _prepare_ceos_image(server_host=server_host)
+        _deploy_ceos_containers(
             server_host=server_host,
             testbed_resources=testbed_resources,
             testbed_name=testbed.name
@@ -1312,7 +1317,7 @@ def _find_deployed_server(testbed_name: str, group_inventory_file: str, server: 
     """
     logger.info("Checking if testbed is deployed on any server in the group")
     servers = AnsibleHosts(group_inventory_file, 'server')
-    deployed_testbeds = get_all_deployed_testbeds(servers)
+    deployed_testbeds = _get_all_deployed_testbeds(servers)
 
     # Find which server has this testbed
     found_server = None
@@ -1342,82 +1347,6 @@ def _find_deployed_server(testbed_name: str, group_inventory_file: str, server: 
         logger.info(f"Auto-detected server '{found_server}' for undeployment")
 
     return found_server, deployed_testbed_info
-
-
-def _undeploy_ceos_containers(
-        server_host: TestServer,
-        testbed_name: str,
-        neighbors: dict
-    ):
-    """
-    Remove cEOS and net containers using Docker Compose.
-
-    Args:
-        server_host: TestServer object for the target server
-        testbed_name: Name of the testbed
-        neighbors: Dictionary of neighbor configurations (names as keys)
-    """
-    if not neighbors:
-        logger.debug("No neighbors to remove, skipping container removal")
-        return
-
-    logger.info(f"Removing cEOS and net containers for {len(neighbors)} neighbor(s)")
-
-    # Remove cEOS containers - check if compose file exists, regenerate if needed
-    ceos_compose_file_path = f"/tmp/docker-compose-ceos-{testbed_name}.yml"
-    file_stat = server_host.stat(path=ceos_compose_file_path)
-
-    if not file_stat.get('stat', {}).get('exists', False):
-        logger.debug(f"cEOS compose file not found at {ceos_compose_file_path}, regenerating")
-        ceos_image = server_host.get_visible_var('ceos_image')
-        if ceos_image:
-            compose_config = _build_ceos_containers_compose_config(neighbors, ceos_image)
-            compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
-            server_host.copy(
-                content=compose_yaml,
-                dest=ceos_compose_file_path,
-                mode='0644',
-                task_directives={"become": True}
-            )
-        else:
-            logger.warning("ceos_image variable not found, skipping cEOS container removal")
-            ceos_compose_file_path = None
-
-    if ceos_compose_file_path:
-        logger.debug(f"Removing {len(neighbors)} cEOS container(s) using compose file: {ceos_compose_file_path}")
-        server_host.shell(
-            f"docker compose -f {ceos_compose_file_path} down",
-            task_directives={"become": True, "ignore_errors": True}
-        )
-        logger.info(f"Removed {len(neighbors)} cEOS container(s)")
-
-    # Remove net containers - check if compose file exists, regenerate if needed
-    net_compose_file_path = f"/tmp/docker-compose-net-{testbed_name}.yml"
-    file_stat = server_host.stat(path=net_compose_file_path)
-
-    if not file_stat.get('stat', {}).get('exists', False):
-        logger.debug(f"Net compose file not found at {net_compose_file_path}, regenerating")
-        docker_registry = server_host.get_visible_var('docker_registry_host')
-        if docker_registry:
-            compose_config = _build_net_containers_compose_config(neighbors, docker_registry)
-            compose_yaml = yaml.dump(compose_config, default_flow_style=False, sort_keys=False)
-            server_host.copy(
-                content=compose_yaml,
-                dest=net_compose_file_path,
-                mode='0644',
-                task_directives={"become": True}
-            )
-        else:
-            logger.warning("docker_registry_host variable not found, skipping net container removal")
-            net_compose_file_path = None
-
-    if net_compose_file_path:
-        logger.debug(f"Removing {len(neighbors)} net container(s) using compose file: {net_compose_file_path}")
-        server_host.shell(
-            f"docker compose -f {net_compose_file_path} down",
-            task_directives={"become": True, "ignore_errors": True}
-        )
-        logger.info(f"Removed {len(neighbors)} net container(s)")
 
 
 def _undeploy_kvm_vms(server_host: TestServer, duts_info: dict):

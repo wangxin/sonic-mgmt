@@ -73,14 +73,14 @@ class CallbackModule(CallbackBase):
         log_func(msg)
 
     def v2_runner_on_ok(self, result):
-        hostname = result._host.get_name()
+        hostname = str(result._host.get_name())
         module_name = self._get_module_name(result)
 
         if hostname not in self._results:
             self._results[hostname] = []
 
         res = dict(hostname=hostname, reachable=True, failed=False)
-        res.update(result._result)
+        res.update(json.loads(json.dumps(result._result)))
 
         if 'invocation' in res and isinstance(res['invocation'], dict):
             res['invocation']['module_name'] = module_name
@@ -93,14 +93,14 @@ class CallbackModule(CallbackBase):
 
 
     def v2_runner_on_failed(self, result, *args, **kwargs):
-        hostname = result._host.get_name()
+        hostname = str(result._host.get_name())
         module_name = self._get_module_name(result)
 
         if hostname not in self._results:
             self._results[hostname] = []
 
         res = dict(hostname=hostname, reachable=True, failed=True)
-        res.update(result._result)
+        res.update(json.loads(json.dumps(result._result)))
 
         if 'invocation' in res and isinstance(res['invocation'], dict):
             res['invocation']['module_name'] = module_name
@@ -112,14 +112,14 @@ class CallbackModule(CallbackBase):
 
 
     def v2_runner_on_unreachable(self, result):
-        hostname = result._host.get_name()
+        hostname = str(result._host.get_name())
         module_name = self._get_module_name(result)
 
         if hostname not in self._results:
             self._results[hostname] = []
 
         res = dict(hostname=hostname, reachable=False, failed=True)
-        res.update(result._result)
+        res.update(json.loads(json.dumps(result._result)))
 
         if 'invocation' in res and isinstance(res['invocation'], dict):
             res['invocation']['module_name'] = module_name

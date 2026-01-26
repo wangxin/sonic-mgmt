@@ -1,10 +1,9 @@
 import json
 import logging
-import contextlib
 from functools import cached_property
 
 from .ansible_hosts import AnsibleHost
-from ..config import CONSTANTS as C
+from ..settings import CONSTANTS as C
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +408,66 @@ class TestServer(AnsibleHost):
 
         logger.info(f"Successfully installed and configured Docker on {self.hostname}")
 
+    def _set_sysctl(self):
+        """
+        Configure kernel sysctl parameters for testbed server.
+
+        Raises:
+            Exception: If sysctl configuration fails
+        """
+        logger.info(f"Configuring sysctl parameters on {self.hostname}")
+
+        # Load br_netfilter kernel module (required for bridge netfilter sysctl parameters)
+        logger.debug(f"Loading br_netfilter kernel module")
+        self.load_module(
+            "community.general.modprobe",
+            module_args={
+                "name": "br_netfilter",
+                "state": "present",
+            },
+            task_directives={"become": True}
+        )
+        self.run_loaded_modules()
+
+        # Define all sysctl parameters to configure
+        sysctl_params = {
+            "kernel.pty.max": 8192,
+            "net.bridge.bridge-nf-call-arptables": 0,
+            "net.bridge.bridge-nf-call-ip6tables": 0,
+            "net.bridge.bridge-nf-call-iptables": 0,
+            "net.core.rmem_max": 509430500,
+            "net.core.rmem_default": 31457280,
+            "net.ipv6.route.max_size": 16384,
+            "net.ipv4.neigh.default.gc_thresh1": 8192,
+            "net.ipv6.neigh.default.gc_thresh1": 8192,
+            "net.ipv4.neigh.default.gc_thresh2": 16384,
+            "net.ipv6.neigh.default.gc_thresh2": 16384,
+            "net.ipv4.neigh.default.gc_thresh3": 32768,
+            "net.ipv6.neigh.default.gc_thresh3": 32768,
+            "kernel.pid_max": 4194304,
+            "fs.inotify.max_user_instances": 1048576,
+        }
+
+        # Apply all sysctl parameters
+        for param_name, param_value in sysctl_params.items():
+            logger.debug(f"Setting {param_name} = {param_value}")
+            self.load_module(
+                "ansible.posix.sysctl",
+                module_args={
+                    "name": param_name,
+                    "value": param_value,
+                    "state": "present",
+                    "sysctl_set": True,
+                    "reload": True,
+                },
+                task_directives={"become": True}
+            )
+
+        # Execute all loaded sysctl modules in batch
+        self.run_loaded_modules()
+
+        logger.info(f"Successfully configured {len(sysctl_params)} sysctl parameters on {self.hostname}")
+
     def setup_server(self, force=False):
         """
         Setup the server by installing required packages and marking it as ready.
@@ -450,6 +509,9 @@ class TestServer(AnsibleHost):
 
         # Install Docker
         self._install_docker()
+
+        # Configure sysctl parameters
+        self._set_sysctl()
 
         # Create server ready marker file
         logger.debug(f"Creating server ready marker file at {self.SERVER_READY_FILE}")
